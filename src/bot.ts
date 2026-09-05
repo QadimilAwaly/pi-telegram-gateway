@@ -1129,7 +1129,28 @@ bot.on(["message:text", "message:photo", "message:document"], async (ctx) => {
   let fullResponse = "";
   let modelErrorMessage: string | null = null;
   let statusMessageId: number | null = null;
+  let deliveredResponse = false;
   const toolLog: string[] = [];
+
+  // Helper to safely send a completed turn message to Telegram
+  const sendTurnResponse = async (text: string) => {
+    if (!text || !text.trim()) return;
+    if (statusMessageId) {
+      const msgIdToDelete = statusMessageId;
+      statusMessageId = null;
+      await ctx.api.deleteMessage(chatId, msgIdToDelete).catch(() => {});
+    }
+    const htmlContent = markdownToTelegramHtml(text);
+    const chunks = splitMessage(htmlContent);
+    for (const chunk of chunks) {
+      try {
+        await ctx.reply(chunk, { parse_mode: "HTML" });
+      } catch (tgErr: any) {
+        console.error("HTML send error, falling back to plain text:", tgErr.message);
+        await ctx.reply(chunk.replace(/<[^>]*>/g, ""));
+      }
+    }
+  };
 
   // Throttled tool status updates (avoids Telegram 429 Flood Control)
   let lastStatusEdit = 0;
@@ -1183,6 +1204,23 @@ bot.on(["message:text", "message:photo", "message:document"], async (ctx) => {
             if (texts) fullResponse = texts;
           }
         }
+      } else if (event.type === "turn_end") {
+        // When a turn ends without tool calls, it produced a conversational response for that turn!
+        if (event.toolResults.length === 0) {
+          let textToSend = fullResponse;
+          if (!textToSend && event.message?.role === "assistant" && (event.message as any).content) {
+            textToSend = (event.message as any).content
+              .filter((c: any) => c.type === "text")
+              .map((c: any) => c.text)
+              .join("\n");
+          }
+          if (textToSend && textToSend.trim()) {
+            await sendTurnResponse(textToSend);
+            deliveredResponse = true;
+            fullResponse = "";
+            toolLog.length = 0;
+          }
+        }
       } else if (event.type === "agent_end") {
         const lastMsg = event.messages?.[event.messages.length - 1];
         if (lastMsg?.role === "assistant" && lastMsg.errorMessage) {
@@ -1226,25 +1264,16 @@ bot.on(["message:text", "message:photo", "message:document"], async (ctx) => {
       return;
     }
 
-    if (!fullResponse || !fullResponse.trim()) {
-      fullResponse = "*(Completed with no text output)*";
+    // If turn_end already delivered the message(s), we're all set!
+    if (!deliveredResponse) {
+      if (!fullResponse || !fullResponse.trim()) {
+        fullResponse = "*(Completed with no text output)*";
+      }
+      await sendTurnResponse(fullResponse);
     }
 
     const elapsedSec = ((Date.now() - turnStartTime) / 1000).toFixed(2);
-    console.log(`✅ [Prompt Turn Complete] Finished in ${elapsedSec}s. Output length: ${fullResponse.length} chars.`);
-
-    // Convert LLM / CLI Markdown to clean Telegram HTML and split safely
-    const htmlContent = markdownToTelegramHtml(fullResponse);
-    const chunks = splitMessage(htmlContent);
-
-    for (const chunk of chunks) {
-      try {
-        await ctx.reply(chunk, { parse_mode: "HTML" });
-      } catch (tgErr: any) {
-        console.error("HTML send error, falling back to plain text:", tgErr.message);
-        await ctx.reply(chunk.replace(/<[^>]*>/g, ""));
-      }
-    }
+    console.log(`✅ [Prompt Turn Complete] Finished in ${elapsedSec}s.`);
   } catch (err: any) {
     if (statusMessageId) {
       await ctx.api.deleteMessage(chatId, statusMessageId).catch(() => {});
