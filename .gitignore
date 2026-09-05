@@ -1,0 +1,55 @@
+# =======================================================
+# Pi Telegram Gateway - Hardened .gitignore
+# =======================================================
+
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Environment Variables & Secrets (CRITICAL)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.cert
+*.crt
+auth.json
+
+# Runtime & Process Artifacts
+*.log
+*.log.*
+logs/
+nohup.out
+*.pid
+gateway.lock
+
+# Build & Compilation Outputs
+dist/
+out/
+build/
+*.tsbuildinfo
+
+# Caches & Temp Files
+.cache/
+.eslintcache
+tmp/
+temp/
+*.tmp
+
+# Telegram Sessions & Media Artifacts
+sessions/
+telegram-sessions/
+images/
+*.session
+*.jsonl
+*.jsonl.gz
+
+# Editor & System Files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

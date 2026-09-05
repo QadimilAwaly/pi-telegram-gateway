@@ -1,0 +1,25 @@
+{
+  "name": "pi-telegram-gateway",
+  "version": "1.0.0",
+  "description": "Telegram Gateway for Pi Coding Agent via Pi SDK",
+  "main": "src/bot.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "bun run src/bot.ts",
+    "dev": "bun --watch src/bot.ts",
+    "daemon": "./scripts/run.sh",
+    "restart": "./scripts/restart.sh",
+    "status": "bun run src/status.ts"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.4",
+    "croner": "^10.0.1",
+    "dotenv": "^17.4.2",
+    "grammy": "^1.46.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.9.3"
+  }
+}

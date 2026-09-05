@@ -1,0 +1,206 @@
+import fs from "fs";
+import path from "path";
+import { config } from "./config";
+import { stripAnsi } from "./telegram-utils";
+
+export type LogLevel = "INFO" | "WARN" | "ERROR" | "DEBUG";
+
+export interface LogEntry {
+  timestamp: number;
+  timeStr: string;
+  level: LogLevel;
+  message: string;
+}
+
+export class GatewayLogger {
+  private logFile: string;
+  private maxFileSizeBytes: number = 3 * 1024 * 1024; // 3MB per file
+  private ringBuffer: LogEntry[] = [];
+  private maxRingBufferSize: number = 200;
+  private originalConsole: {
+    log: typeof console.log;
+    info: typeof console.info;
+    warn: typeof console.warn;
+    error: typeof console.error;
+  } | null = null;
+  private isInitialized: boolean = false;
+
+  constructor() {
+    this.logFile = path.join(config.sessionsDir, "gateway.log");
+  }
+
+  init() {
+    if (this.isInitialized) return;
+    this.isInitialized = true;
+
+    if (!fs.existsSync(config.sessionsDir)) {
+      fs.mkdirSync(config.sessionsDir, { recursive: true });
+    }
+
+    // Save original console functions
+    this.originalConsole = {
+      log: console.log.bind(console),
+      info: console.info.bind(console),
+      warn: console.warn.bind(console),
+      error: console.error.bind(console),
+    };
+
+    // Hook console functions
+    console.log = (...args: any[]) => {
+      this.originalConsole?.log(...args);
+      this.write("INFO", args);
+    };
+
+    console.info = (...args: any[]) => {
+      this.originalConsole?.info(...args);
+      this.write("INFO", args);
+    };
+
+    console.warn = (...args: any[]) => {
+      this.originalConsole?.warn(...args);
+      this.write("WARN", args);
+    };
+
+    console.error = (...args: any[]) => {
+      this.originalConsole?.error(...args);
+      this.write("ERROR", args);
+    };
+
+    this.info("GatewayLogger initialized. Capturing stdout & stderr to " + this.logFile);
+  }
+
+  private formatArgs(args: any[]): string {
+    return args
+      .map((arg) => {
+        if (typeof arg === "string") return arg;
+        if (arg instanceof Error) return `${arg.message}\n${arg.stack || ""}`;
+        try {
+          return JSON.stringify(arg);
+        } catch {
+          return String(arg);
+        }
+      })
+      .join(" ");
+  }
+
+  private rotateIfNecessary() {
+    try {
+      if (fs.existsSync(this.logFile)) {
+        const stat = fs.statSync(this.logFile);
+        if (stat.size > this.maxFileSizeBytes) {
+          const oldFile = `${this.logFile}.old`;
+          if (fs.existsSync(oldFile)) {
+            fs.unlinkSync(oldFile);
+          }
+          fs.renameSync(this.logFile, oldFile);
+        }
+      }
+    } catch {}
+  }
+
+  private write(level: LogLevel, args: any[]) {
+    const rawMsg = this.formatArgs(args);
+    const cleanMsg = stripAnsi(rawMsg).trim();
+    if (!cleanMsg) return;
+
+    const now = new Date();
+    const timeStr = now.toLocaleString("id-ID", {
+      timeZone: "Asia/Makassar",
+      dateStyle: "short",
+      timeStyle: "medium",
+    });
+
+    const entry: LogEntry = {
+      timestamp: Date.now(),
+      timeStr,
+      level,
+      message: cleanMsg,
+    };
+
+    // 1. In-Memory Ring Buffer
+    this.ringBuffer.push(entry);
+    if (this.ringBuffer.length > this.maxRingBufferSize) {
+      this.ringBuffer.shift();
+    }
+
+    // 2. Persistent Rotating Log File
+    try {
+      this.rotateIfNecessary();
+      const line = `[${timeStr}] [${level}] ${cleanMsg}\n`;
+      fs.appendFileSync(this.logFile, line, "utf-8");
+    } catch {}
+  }
+
+  info(...args: any[]) {
+    if (this.originalConsole) {
+      this.originalConsole.info(...args);
+    } else {
+      console.info(...args);
+    }
+  }
+
+  warn(...args: any[]) {
+    if (this.originalConsole) {
+      this.originalConsole.warn(...args);
+    } else {
+      console.warn(...args);
+    }
+  }
+
+  error(...args: any[]) {
+    if (this.originalConsole) {
+      this.originalConsole.error(...args);
+    } else {
+      console.error(...args);
+    }
+  }
+
+  /**
+   * Get recent log entries for display or inspection
+   */
+  getRecentLogs(options: { limit?: number; level?: LogLevel | "ALL" } = {}): LogEntry[] {
+    const limit = Math.min(options.limit || 20, 100);
+    const level = options.level || "ALL";
+
+    let filtered = this.ringBuffer;
+    if (level !== "ALL") {
+      filtered = filtered.filter((e) => e.level === level);
+    }
+
+    return filtered.slice(-limit);
+  }
+
+  /**
+   * Clear the log file and in-memory buffer
+   */
+  clearLogs(): boolean {
+    this.ringBuffer = [];
+    try {
+      if (fs.existsSync(this.logFile)) {
+        fs.writeFileSync(this.logFile, "", "utf-8");
+      }
+      const oldFile = `${this.logFile}.old`;
+      if (fs.existsSync(oldFile)) {
+        fs.unlinkSync(oldFile);
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  getLogFilePath(): string {
+    return this.logFile;
+  }
+
+  getLogFileSizeKb(): number {
+    try {
+      if (fs.existsSync(this.logFile)) {
+        return Math.round(fs.statSync(this.logFile).size / 1024);
+      }
+    } catch {}
+    return 0;
+  }
+}
+
+export const gatewayLogger = new GatewayLogger();

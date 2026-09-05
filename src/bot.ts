@@ -1,0 +1,1348 @@
+import path from "path";
+import fs from "fs";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { Bot, Context } from "grammy";
+
+const execFileAsync = promisify(execFile);
+import { config } from "./config";
+import { sessionPool } from "./session-pool";
+import { cronScheduler } from "./cron-scheduler";
+import { healthMonitor } from "./health-monitor";
+import { sessionArchiver } from "./session-archiver";
+import { SingleInstanceGuard } from "./single-instance-lock";
+import {
+  splitMessage,
+  formatToolStatus,
+  markdownToTelegramHtml,
+  escapeHtml,
+} from "./telegram-utils";
+
+import { gatewayLogger } from "./logger";
+gatewayLogger.init();
+
+if (!config.botToken) {
+  console.error("❌ ERROR: TELEGRAM_BOT_TOKEN is not defined in environment or .env!");
+  console.error("Please create a .env file with your Telegram Bot Token.");
+  process.exit(1);
+}
+
+const bot = new Bot(config.botToken);
+
+// Middleware: Access Control Whitelist
+bot.use(async (ctx, next) => {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+
+  if (config.allowedUsers.length > 0 && !config.allowedUsers.includes(userId)) {
+    await ctx.reply(
+      `⛔ <b>Access Denied</b>\nYour Telegram User ID is <code>${userId}</code>.\nTo grant access, add this ID to <code>ALLOWED_USERS</code> in your gateway <code>.env</code> file.`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  await next();
+});
+
+// Command: /start
+bot.command("start", async (ctx) => {
+  const welcome = [
+    "🤖 <b>Welcome to Pi Coding Agent on Telegram!</b>",
+    "",
+    "Pi is a minimalist, tool-augmented coding assistant running directly on your host/device.",
+    "",
+    "<b>Commands:</b>",
+    "• <code>/help</code> — Show command guide",
+    "• <code>/new</code> or <code>/reset</code> — Start a fresh conversation session",
+    "• <code>/status</code> — View current model and session info",
+    "• <code>/model [name]</code> — View or switch model",
+    "• <code>/steer &lt;text&gt;</code> — Steer/redirect active agent execution",
+    "• <code>/cron</code> — Manage scheduled cron tasks",
+    "• <code>/logs</code> — View recent gateway logs and errors live",
+    "• <code>/archive</code> — Manage session archives & Mnemosyne consolidation",
+    "• <code>/compact</code> — Compact conversation context",
+    "• <code>/restart</code> — Restart the gateway process remotely",
+    "• <code>/abort</code> — Stop the active prompt execution",
+    "",
+    "Just send any message or coding task to get started!",
+  ].join("\n");
+
+  await ctx.reply(welcome, { parse_mode: "HTML" });
+});
+
+// Command: /help
+bot.command("help", async (ctx) => {
+  const helpText = [
+    "📖 <b>Pi Telegram Gateway Commands & Features</b>",
+    "",
+    "• <b>Chatting:</b> Simply type your prompt. Pi executes bash commands, edits files, and uses installed skills.",
+    "• <b>Follow-up Queueing:</b> If you send a message while Pi is busy, it is automatically queued as a follow-up task!",
+    "• <code>/steer &lt;instruction&gt;</code> — Redirect or modify the active agent's plan mid-flight.",
+    "• <code>/new</code> or <code>/reset</code> — Clear current session and start fresh.",
+    "• <code>/status</code> — Check current session ID, model, and message count.",
+    "• <code>/model</code> — Show active model and available alternatives.",
+    "• <code>/model &lt;provider/name&gt;</code> — Switch active model for this chat.",
+    "• <code>/cron</code> — Manage scheduled background jobs and recurring tasks.",
+    "• <code>/logs</code> — View live gateway execution logs, tool calls, and errors.",
+    "• <code>/archive</code> — View storage stats, compress old sessions (.gz), and export transcripts.",
+    "• <code>/compact</code> — Summarize and compact conversation history.",
+    "• <code>/restart</code> — Reboot and re-initialize the gateway daemon.",
+    "• <code>/abort</code> — Abort the currently running operation.",
+  ].join("\n");
+
+  await ctx.reply(helpText, { parse_mode: "HTML" });
+});
+
+// Command: /new or /reset
+const handleReset = async (ctx: Context) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return;
+
+  await ctx.replyWithChatAction("typing");
+  try {
+    const session = await sessionPool.resetSession(chatId);
+    await ctx.reply(
+      `✨ <b>Session Reset!</b> Started a new session:\n<code>${escapeHtml(session.sessionId)}</code>`,
+      { parse_mode: "HTML" }
+    );
+  } catch (err: any) {
+    await ctx.reply(`⚠️ Failed to reset session: ${escapeHtml(err.message)}`, { parse_mode: "HTML" });
+  }
+};
+bot.command("new", handleReset);
+bot.command("reset", handleReset);
+
+// Command: /restart (Remote Gateway Reboot)
+bot.command("restart", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return;
+
+  await ctx.reply(
+    "🔄 <b>Restarting Pi Telegram Gateway...</b>\nRe-initializing extensions, skills, and model sessions. Back online in ~2 seconds!",
+    { parse_mode: "HTML" }
+  );
+
+  console.log(`🔄 Remote /restart requested via Telegram by user ${ctx.from?.id}`);
+
+  // Clean shutdown & trigger runner restart
+  setTimeout(async () => {
+    try {
+      healthMonitor.destroy();
+      cronScheduler.destroy();
+      sessionPool.destroy();
+      await bot.stop();
+    } catch {}
+
+    const isUnderRunner = process.env.RUNNER_ACTIVE === "1";
+    if (!isUnderRunner) {
+      try {
+        Bun.spawn(["bash", "-c", "nohup ./scripts/run.sh > /dev/null 2>&1 &"], {
+          cwd: path.resolve(__dirname, ".."),
+        });
+      } catch {}
+    }
+
+    process.exit(42);
+  }, 500);
+});
+
+// Helper: Fetch Termux Battery Status
+async function getDeviceBatteryStatus(): Promise<string | null> {
+  try {
+    const binPath = "/data/data/com.termux/files/usr/bin/termux-battery-status";
+    const { stdout } = await execFileAsync(binPath, [], {
+      timeout: 2000,
+      env: { ...process.env, PATH: "/data/data/com.termux/files/usr/bin:" + (process.env.PATH || "") },
+    });
+    const data = JSON.parse(stdout);
+    const pct = data.percentage ?? data.level;
+    const status = data.status || (data.plugged !== "UNPLUGGED" ? "CHARGING" : "DISCHARGING");
+    const icon = status === "CHARGING" ? "⚡" : pct <= 20 ? "🪫" : "🔋";
+    return `${icon} ${pct}% (${status})`;
+  } catch {
+    return null;
+  }
+}
+
+function formatNumber(num: number): string {
+  return new Intl.NumberFormat("en-US").format(num);
+}
+
+function formatCompactTokens(num: number): string {
+  if (num >= 1_000_000) {
+    return `${(num / 1_000_000).toFixed(1)}M`;
+  }
+  if (num >= 1_000) {
+    return `${(num / 1_000).toFixed(1)}k`;
+  }
+  return String(num);
+}
+
+// Command: /status
+bot.command("status", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return;
+
+  try {
+    const entry = await sessionPool.getSession(chatId);
+    const session = entry.session;
+    const model = session.model;
+    const messageCount = session.messages.length;
+
+    // Retrieve rich session stats & context usage
+    const stats: any = session.getSessionStats ? session.getSessionStats() : null;
+    const usedContextTokens = stats?.contextUsage?.tokens ?? 0;
+    const maxContextTokens = model?.contextWindow ?? stats?.contextUsage?.contextWindow ?? 1_048_576;
+    const contextPercent = maxContextTokens > 0 ? ((usedContextTokens / maxContextTokens) * 100).toFixed(1) : "0.0";
+
+    const batteryInfo = await getDeviceBatteryStatus();
+
+    const statusMsg = [
+      "📊 <b>Pi Session Status</b>",
+      `• <b>Session ID:</b> <code>${escapeHtml(session.sessionId)}</code>`,
+      `• <b>Model:</b> <code>${escapeHtml(model ? `${model.provider}/${model.id}` : "default")}</code>`,
+      `• <b>Context Window:</b> <code>${formatNumber(usedContextTokens)} / ${formatNumber(maxContextTokens)} tokens (${contextPercent}%)</code>`,
+    ];
+
+    if (stats?.tokens?.total) {
+      const totalFormatted = formatCompactTokens(stats.tokens.total);
+      const cacheNote = stats.tokens.cacheRead ? ` <i>(Cached: ${formatCompactTokens(stats.tokens.cacheRead)})</i>` : "";
+      statusMsg.push(`• <b>Session Tokens:</b> <code>${totalFormatted} total</code>${cacheNote}`);
+    }
+
+    statusMsg.push(`• <b>Messages:</b> ${messageCount}`);
+
+    if (batteryInfo) {
+      statusMsg.push(`• <b>Device Battery:</b> ${batteryInfo}`);
+    }
+
+    statusMsg.push(`• <b>Working Dir:</b> <code>${escapeHtml(config.defaultCwd)}</code>`);
+    statusMsg.push(`• <b>Processing:</b> ${entry.isProcessing ? "⏳ Yes" : "✅ Idle"}`);
+
+    await ctx.reply(statusMsg.join("\n"), { parse_mode: "HTML" });
+  } catch (err: any) {
+    await ctx.reply(`⚠️ Failed to get status: ${escapeHtml(err.message)}`, { parse_mode: "HTML" });
+  }
+});
+
+// Command: /compact
+bot.command("compact", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return;
+
+  await ctx.reply("⏳ Compacting context...");
+  try {
+    const result = await sessionPool.compactSession(chatId);
+    await ctx.reply(`✅ <b>${escapeHtml(result)}</b>`, { parse_mode: "HTML" });
+  } catch (err: any) {
+    await ctx.reply(`⚠️ Compaction failed: ${escapeHtml(err.message)}`, { parse_mode: "HTML" });
+  }
+});
+
+// Command: /abort & /stop
+const handleAbort = async (ctx: Context) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return;
+
+  const aborted = await sessionPool.abortPrompt(chatId);
+  if (aborted) {
+    await ctx.reply("🛑 <b>Operation Aborted!</b> Stopped active execution immediately.", {
+      parse_mode: "HTML",
+    });
+  } else {
+    await ctx.reply("ℹ️ No active prompt was running to abort.", {
+      parse_mode: "HTML",
+    });
+  }
+};
+bot.command("abort", handleAbort);
+bot.command("stop", handleAbort);
+
+// Command: /steer
+bot.command("steer", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return;
+
+  const text = ctx.message?.text || "";
+  const steerText = text.replace(/^\/steer\s*/i, "").trim();
+
+  if (!steerText) {
+    await ctx.reply("⚠️ Usage: <code>/steer &lt;instructions&gt;</code>\nExample: <code>/steer Stop editing file A, use file B instead</code>", {
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  const entry = await sessionPool.getSession(chatId);
+  if (!entry.isProcessing && !entry.session.isStreaming) {
+    await ctx.reply("ℹ️ No active prompt is currently running to steer. You can send it as a regular message instead.", {
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  try {
+    await entry.session.steer(steerText);
+    await ctx.reply(`🧭 <b>Steering Injected:</b> <i>"${escapeHtml(steerText)}"</i>\nPi will adjust its course on the next step.`, {
+      parse_mode: "HTML",
+    });
+  } catch (err: any) {
+    await ctx.reply(`⚠️ Failed to steer: ${escapeHtml(err.message)}`, { parse_mode: "HTML" });
+  }
+});
+
+// Command: /archive
+bot.command("archive", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return;
+
+  const text = ctx.message?.text || "";
+  const rawArgs = text.replace(/^\/archive\s*/i, "").trim();
+
+  // 1. Status & Overview (default)
+  if (!rawArgs || rawArgs === "status" || rawArgs === "list") {
+    const stats = sessionArchiver.getStorageStats(chatId);
+    const archives = sessionArchiver.listArchived(chatId);
+
+    const activeKb = (stats.activeBytes / 1024).toFixed(1);
+    const archOrigKb = (stats.archivedOriginalBytes / 1024).toFixed(1);
+    const archCompKb = (stats.archivedCompressedBytes / 1024).toFixed(1);
+
+    const msg = [
+      "📚 <b>Hermes-Style Session Librarian & Storage Stats</b>",
+      "",
+      `• <b>Active Sessions:</b> ${stats.activeSessionCount} file(s) (<code>${activeKb} KB</code>)`,
+      `• <b>Archived Sessions:</b> ${stats.archivedSessionCount} file(s)`,
+      `• <b>Storage Saved:</b> <code>${archOrigKb} KB</code> ➔ <code>${archCompKb} KB</code> (<b>${stats.totalSavingsPercentage.toFixed(1)}% Saved</b>)`,
+      "",
+    ];
+
+    if (archives.length > 0) {
+      msg.push("<b>Recent Archives (Compressed .jsonl.gz):</b>");
+      for (const item of archives.slice(0, 5)) {
+        const dateStr = new Date(item.archivedAt).toLocaleDateString("id-ID", {
+          timeZone: "Asia/Makassar",
+        });
+        const ratio = ((1 - item.compressedSize / item.originalSize) * 100).toFixed(0);
+        msg.push(`• 📦 <code>${item.archiveId}</code> (${dateStr})`);
+        msg.push(`  ↳ <i>${escapeHtml(item.summary || item.originalFileName)}</i>`);
+        msg.push(`  ↳ <code>${(item.originalSize / 1024).toFixed(1)}KB</code> ➔ <code>${(item.compressedSize / 1024).toFixed(1)}KB</code> (-${ratio}%)`);
+      }
+      if (archives.length > 5) {
+        msg.push(`<i>...and ${archives.length - 5} more archived sessions</i>`);
+      }
+      msg.push("");
+    }
+
+    msg.push("<b>Commands:</b>");
+    msg.push("• <code>/archive now</code> — Soft-archive & compress all inactive sessions");
+    msg.push("• <code>/archive export</code> — Export active session as Markdown (.md)");
+    msg.push("• <code>/archive restore &lt;id&gt;</code> — Decompress & restore an archived session");
+    msg.push("• <code>/archive help</code> — Full documentation");
+
+    await ctx.reply(msg.join("\n"), { parse_mode: "HTML" });
+    return;
+  }
+
+  // 2. Help
+  if (rawArgs === "help") {
+    const helpMsg = [
+      "📚 <b>Session Archiver & Mnemosyne Consolidation Guide</b>",
+      "",
+      "Non-destructive 3-tier session archiving inspired by Hermes Agent:",
+      "",
+      "1. <b>Tier 1: Active Context:</b> Active session stays fast and clean.",
+      "2. <b>Tier 2: Mnemosyne Distillation:</b> Key facts and decisions are extracted and saved to shared memory before archival.",
+      "3. <b>Tier 3: Gzip Soft-Archive:</b> Inactive session files are compressed (.jsonl.gz), saving 90%+ disk space with <b>zero data loss</b>.",
+      "",
+      "<b>Subcommands:</b>",
+      "• <code>/archive</code> — View storage stats and archive list",
+      "• <code>/archive now</code> — Force archive all inactive sessions now",
+      "• <code>/archive export</code> — Export current transcript to readable Markdown",
+      "• <code>/archive restore &lt;archive_id&gt;</code> — Restore an archived session",
+    ].join("\n");
+    await ctx.reply(helpMsg, { parse_mode: "HTML" });
+    return;
+  }
+
+  // 3. Force Archive Now
+  if (rawArgs === "now") {
+    await ctx.reply("⏳ Consolidating to Mnemosyne and compressing inactive sessions...");
+    try {
+      const entry = await sessionPool.getSession(chatId);
+      const activeFile = entry.session.sessionFile;
+      const res = await sessionArchiver.archiveInactiveSessions(chatId, {
+        keepLatest: 1,
+        exportMarkdown: true,
+        activeSessionFile: activeFile,
+      });
+
+      if (res.archivedCount === 0) {
+        await ctx.reply("ℹ️ All inactive sessions are already archived. Active session is current.");
+      } else {
+        const savedKb = (res.savedBytes / 1024).toFixed(1);
+        const reportMsg = [
+          `✅ <b>Archival Complete!</b>`,
+          `• <b>Archived:</b> ${res.archivedCount} session file(s)`,
+          `• <b>Disk Saved:</b> <code>${savedKb} KB</code>`,
+          `• <b>Knowledge Distilled:</b> Saved highlights to Mnemosyne (<code>mnemosyne.db</code>)`,
+          "",
+          ...res.reports,
+        ].join("\n");
+        await ctx.reply(reportMsg, { parse_mode: "HTML" });
+      }
+    } catch (err: any) {
+      await ctx.reply(`⚠️ Archival error: ${escapeHtml(err.message)}`, { parse_mode: "HTML" });
+    }
+    return;
+  }
+
+  // 4. Export Current Session to Markdown
+  if (rawArgs === "export") {
+    try {
+      const entry = await sessionPool.getSession(chatId);
+      const activeFile = entry.session.sessionFile;
+      if (!activeFile || !fs.existsSync(activeFile)) {
+        await ctx.reply("⚠️ Active session file not found on disk.");
+        return;
+      }
+
+      const { markdown, summary } = sessionArchiver.exportToMarkdown(activeFile);
+      const exportDir = path.join(config.defaultCwd, "Downloads", "Pi-Exports");
+      if (!fs.existsSync(exportDir)) {
+        fs.mkdirSync(exportDir, { recursive: true });
+      }
+
+      const exportFileName = `pi_session_${new Date().toISOString().slice(0, 10)}_${entry.session.sessionId.slice(0, 8)}.md`;
+      const exportFilePath = path.join(exportDir, exportFileName);
+      fs.writeFileSync(exportFilePath, markdown, "utf-8");
+
+      const replyMsg = [
+        "📄 <b>Session Exported to Markdown!</b>",
+        `• <b>Summary:</b> <i>${escapeHtml(summary)}</i>`,
+        `• <b>File:</b> <code>${escapeHtml(exportFilePath)}</code>`,
+        `• <b>Size:</b> <code>${(markdown.length / 1024).toFixed(1)} KB</code>`,
+        "",
+        "You can open or sync this Markdown file in Obsidian / Docs directly.",
+      ].join("\n");
+
+      await ctx.reply(replyMsg, { parse_mode: "HTML" });
+    } catch (err: any) {
+      await ctx.reply(`⚠️ Export error: ${escapeHtml(err.message)}`, { parse_mode: "HTML" });
+    }
+    return;
+  }
+
+  // 5. Restore Archived Session
+  if (rawArgs.startsWith("restore")) {
+    const targetId = rawArgs.replace(/^restore\s*/i, "").trim();
+    if (!targetId) {
+      await ctx.reply("⚠️ Usage: <code>/archive restore &lt;archive_id&gt;</code>", { parse_mode: "HTML" });
+      return;
+    }
+
+    const res = sessionArchiver.restoreSession(chatId, targetId);
+    if (res.ok) {
+      await ctx.reply(`✅ <b>Restored:</b> <code>${escapeHtml(res.restoredFile || targetId)}</code> has been decompressed and returned to the active session folder.`, {
+        parse_mode: "HTML",
+      });
+    } else {
+      await ctx.reply(`⚠️ Failed to restore: ${escapeHtml(res.error || "Unknown error")}`, { parse_mode: "HTML" });
+    }
+    return;
+  }
+
+  await ctx.reply(`⚠️ Unknown archive command. Use <code>/archive help</code> to view available commands.`, { parse_mode: "HTML" });
+});
+
+// Command: /logs & /log
+bot.command(["logs", "log"], async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return;
+
+  const text = ctx.message?.text || "";
+  const rawArgs = text.replace(/^\/(logs|log)\s*/i, "").trim().toLowerCase();
+
+  // Clear logs
+  if (rawArgs === "clear") {
+    const success = gatewayLogger.clearLogs();
+    if (success) {
+      await ctx.reply("🧹 <b>Gateway logs cleared successfully.</b>", { parse_mode: "HTML" });
+    } else {
+      await ctx.reply("⚠️ Failed to clear gateway logs.", { parse_mode: "HTML" });
+    }
+    return;
+  }
+
+  // Filter errors or custom count
+  const isErrorFilter = rawArgs === "error" || rawArgs === "errors" || rawArgs === "warn";
+  const numArg = parseInt(rawArgs, 10);
+  const limit = !isNaN(numArg) && numArg > 0 ? Math.min(numArg, 50) : isErrorFilter ? 25 : 15;
+
+  const entries = gatewayLogger.getRecentLogs({
+    limit,
+    level: isErrorFilter ? (rawArgs.includes("warn") ? "WARN" : "ERROR") : "ALL",
+  });
+
+  if (entries.length === 0) {
+    await ctx.reply(`📋 <b>No logs recorded matching criteria.</b>\nFile: <code>${gatewayLogger.getLogFilePath()}</code>`, {
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  const logLines = entries
+    .map((e) => {
+      const lvlIcon = e.level === "ERROR" ? "❌" : e.level === "WARN" ? "⚠️" : "ℹ️";
+      const timeOnly = e.timeStr.includes(",") ? e.timeStr.split(",")[1]?.trim() : e.timeStr;
+      return `${timeOnly} ${lvlIcon} [${e.level}] ${e.message}`;
+    })
+    .join("\n");
+
+  const fileSize = gatewayLogger.getLogFileSizeKb();
+  const title = `📋 <b>Pi Gateway Logs (${entries.length} recent, file: ${fileSize} KB):</b>\n\n`;
+  const codeBlock = `<pre>${escapeHtml(logLines)}</pre>\n\n<i>Filter: <code>/logs error</code> | Count: <code>/logs 30</code> | Clear: <code>/logs clear</code></i>`;
+
+  const totalMessage = title + codeBlock;
+  const chunks = splitMessage(totalMessage);
+  for (const chunk of chunks) {
+    try {
+      await ctx.reply(chunk, { parse_mode: "HTML" });
+    } catch {
+      await ctx.reply(chunk.replace(/<[^>]*>/g, ""));
+    }
+  }
+});
+
+// Command: /cron
+bot.command("cron", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return;
+
+  const text = ctx.message?.text || "";
+  const rawArgs = text.replace(/^\/cron\s*/i, "").trim();
+
+  // 1. List or default
+  if (!rawArgs || rawArgs === "list") {
+    const jobs = cronScheduler.listJobs();
+    if (jobs.length === 0) {
+      const emptyMsg = [
+        "⏰ <b>No Scheduled Cron Jobs Found</b>",
+        "",
+        "You can schedule recurring Pi tasks with:",
+        '• <code>/cron add "0 8 * * *" Cek baterai dan cuaca</code>',
+        '• <code>/cron add morning "0 8 * * *" Buat daily briefing</code>',
+        "",
+        "Use <code>/cron help</code> for full syntax and examples.",
+      ].join("\n");
+      await ctx.reply(emptyMsg, { parse_mode: "HTML" });
+      return;
+    }
+
+    let msg = `⏰ <b>Scheduled Cron Jobs (${jobs.length}):</b>\n\n`;
+    for (const job of jobs) {
+      const statusIcon = job.enabled ? "🟢" : "⏸️";
+      const lastStatusIcon =
+        job.lastStatus === "success"
+          ? "✅"
+          : job.lastStatus === "error"
+          ? "❌"
+          : "⏳";
+      const modeBadge = job.noAgent ? "⚡ <i>Script Direct</i>" : "🤖 <i>Agent</i>";
+      msg += `${statusIcon} <b>${escapeHtml(job.name || job.id)}</b> [${modeBadge}] (<code>${escapeHtml(job.id)}</code>)\n`;
+      msg += `  • <b>Schedule:</b> <code>${escapeHtml(job.cronExpression)}</code>\n`;
+      msg += `  • <b>Next Run:</b> <code>${escapeHtml(job.nextRun || "N/A")}</code>\n`;
+      if (job.lastRun) {
+        const lastRunStr = new Date(job.lastRun).toLocaleString("id-ID", {
+          timeZone: job.timezone || "Asia/Jakarta",
+          dateStyle: "short",
+          timeStyle: "short",
+        });
+        const durationStr = job.lastDurationMs ? ` (${(job.lastDurationMs / 1000).toFixed(2)}s)` : "";
+        msg += `  • <b>Last Run:</b> ${lastStatusIcon} ${escapeHtml(lastRunStr)}${durationStr}\n`;
+        if (job.lastError) {
+          msg += `  • <b>Error:</b> <code>${escapeHtml(job.lastError.slice(0, 60))}</code>\n`;
+        }
+      }
+      const promptPreview = escapeHtml(
+        job.prompt.slice(0, 80) + (job.prompt.length > 80 ? "..." : "")
+      );
+      msg += `  • <b>${job.noAgent ? "Command:" : "Prompt:"}</b> <i>${promptPreview}</i>\n\n`;
+    }
+
+    msg += `Commands: <code>/cron add</code>, <code>/cron edit</code>, <code>/cron script</code>, <code>/cron logs &lt;id&gt;</code>, <code>/cron run &lt;id&gt;</code>, <code>/cron pause &lt;id&gt;</code>, <code>/cron rm &lt;id&gt;</code>`;
+    await ctx.reply(msg, {
+      parse_mode: "HTML",
+      link_preview_options: { is_disabled: true },
+    });
+    return;
+  }
+
+  // 2. Help
+  if (rawArgs === "help") {
+    const helpMsg = [
+      "⏰ <b>Pi Cron Scheduler Guide</b>",
+      "",
+      "Schedule autonomous tasks or direct shell scripts.",
+      "",
+      "<b>Commands:</b>",
+      "• <code>/cron</code> or <code>/cron list</code> — List all scheduled tasks",
+      '• <code>/cron add "&lt;cron&gt;" &lt;prompt&gt;</code> — Add Agent task (with reasoning & tools)',
+      '• <code>/cron edit &lt;id&gt; [options]</code> — Edit schedule, prompt, name, or mode',
+      '• <code>/cron script "&lt;cron&gt;" &lt;command&gt;</code> — Add Direct Script task (0 LLM tokens, fast & exact)',
+      "• <code>/cron logs [id]</code> — View execution logs and runtime durations",
+      "• <code>/cron run &lt;id&gt;</code> — Execute job immediately for testing",
+      "• <code>/cron pause &lt;id&gt;</code> — Temporarily pause a job",
+      "• <code>/cron resume &lt;id&gt;</code> — Resume a paused job",
+      "• <code>/cron rm &lt;id&gt;</code> — Delete a job",
+      "",
+      "<b>Examples:</b>",
+      '• Agent: <code>/cron add "0 8 * * *" Berikan ringkasan berita AI terbaru</code>',
+      '• Script: <code>/cron script "0 */2 * * *" termux-battery-status</code>',
+      '• Script: <code>/cron script "*/30 * * *" python3 ~/check_aqi.py</code>',
+    ].join("\n");
+    await ctx.reply(helpMsg, { parse_mode: "HTML" });
+    return;
+  }
+
+  // 3. Subcommands: run, pause, resume, rm, remove, delete, add
+  const firstSpace = rawArgs.indexOf(" ");
+  const sub = (firstSpace === -1 ? rawArgs : rawArgs.substring(0, firstSpace)).toLowerCase();
+  const rest = (firstSpace === -1 ? "" : rawArgs.substring(firstSpace + 1)).trim();
+
+  if (["rm", "remove", "delete"].includes(sub)) {
+    if (!rest) {
+      await ctx.reply("⚠️ Please provide a job ID: <code>/cron rm &lt;id&gt;</code>", { parse_mode: "HTML" });
+      return;
+    }
+    const success = cronScheduler.removeJob(rest);
+    if (success) {
+      await ctx.reply(`🗑️ Job <code>${escapeHtml(rest)}</code> removed successfully.`, { parse_mode: "HTML" });
+    } else {
+      await ctx.reply(`⚠️ Job <code>${escapeHtml(rest)}</code> not found.`, { parse_mode: "HTML" });
+    }
+    return;
+  }
+
+  if (sub === "edit") {
+    if (!rest) {
+      await ctx.reply(
+        "⚠️ Usage: <code>/cron edit &lt;id&gt; [options]</code>\n\n" +
+        "<b>Examples:</b>\n" +
+        '• Ganti jadwal: <code>/cron edit my_job "0 8 * * *"</code>\n' +
+        '• Ganti jadwal & prompt: <code>/cron edit my_job "0 8 * * *" Cek berita AI</code>\n' +
+        '• Pakai flags: <code>/cron edit my_job --cron "0 9 * * *" --name "New Title"</code>\n' +
+        '• Ganti mode: <code>/cron edit my_job --mode script</code> atau <code>--mode agent</code>',
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    const parts = rest.split(/\s+/);
+    const id = parts[0] || "";
+    const editArgs = rest.substring(id.length).trim();
+
+    const existingJob = cronScheduler.getJob(id);
+    if (!existingJob) {
+      await ctx.reply(`⚠️ Job with ID <code>${escapeHtml(id)}</code> not found.`, { parse_mode: "HTML" });
+      return;
+    }
+
+    if (!editArgs) {
+      const currentNext = cronScheduler.getNextRun(id);
+      const modeStr = existingJob.noAgent ? "⚡ Direct Script (0 LLM Tokens)" : "🧠 Agent Reasoning";
+      const infoMsg = [
+        `📋 <b>Edit Cron Job:</b> <code>${escapeHtml(existingJob.id)}</code>`,
+        `• <b>Name:</b> <code>${escapeHtml(existingJob.name || existingJob.id)}</code>`,
+        `• <b>Schedule:</b> <code>${escapeHtml(existingJob.cronExpression)}</code>`,
+        `• <b>Next Run:</b> <code>${escapeHtml(currentNext || "N/A")}</code>`,
+        `• <b>Mode:</b> ${modeStr}`,
+        `• <b>${existingJob.noAgent ? "Command:" : "Prompt:"}</b> <i>${escapeHtml(existingJob.prompt)}</i>`,
+        "",
+        "<b>How to edit:</b>",
+        `• Ganti jadwal: <code>/cron edit ${existingJob.id} "0 8 * * *"</code>`,
+        `• Ganti prompt: <code>/cron edit ${existingJob.id} --prompt "Prompt baru"</code>`,
+        `• Ganti nama: <code>/cron edit ${existingJob.id} --name "Nama baru"</code>`,
+        `• Ganti mode: <code>/cron edit ${existingJob.id} --mode script</code>`,
+      ].join("\n");
+      await ctx.reply(infoMsg, { parse_mode: "HTML" });
+      return;
+    }
+
+    let newCron: string | undefined;
+    let newPrompt: string | undefined;
+    let newName: string | undefined;
+    let newTz: string | undefined;
+    let newNoAgent: boolean | undefined;
+
+    const cronMatch = editArgs.match(/--cron\s+["']?([^"'-]+)["']?/i);
+    if (cronMatch) newCron = cronMatch[1]?.trim();
+
+    const promptMatch = editArgs.match(/--prompt\s+["']?([^"']+)["']?/i);
+    if (promptMatch) newPrompt = promptMatch[1]?.trim();
+
+    const nameMatch = editArgs.match(/--name\s+["']?([^"']+)["']?/i);
+    if (nameMatch) newName = nameMatch[1]?.trim();
+
+    const tzMatch = editArgs.match(/--tz\s+["']?([^"'\s]+)["']?/i);
+    if (tzMatch) newTz = tzMatch[1]?.trim();
+
+    if (/--mode\s+script|--script/i.test(editArgs)) newNoAgent = true;
+    if (/--mode\s+agent|--agent/i.test(editArgs)) newNoAgent = false;
+
+    if (!newCron && !newPrompt && !newName) {
+      const tokens: string[] = [];
+      const regex = /"([^"]*)"|'([^']*)'|(\S+)/g;
+      let match: RegExpExecArray | null;
+      while ((match = regex.exec(editArgs)) !== null) {
+        const val = match[1] ?? match[2] ?? match[3];
+        if (val !== undefined && val.trim().length > 0) {
+          tokens.push(val.trim());
+        }
+      }
+
+      const isCronPart = (s: string) => s.split(" ").length >= 5 || s.includes("*") || s.startsWith("@");
+      const firstTok = tokens[0];
+      if (firstTok && isCronPart(firstTok)) {
+        newCron = firstTok;
+        if (tokens.length > 1) {
+          const firstQuoteEnd = editArgs.indexOf(firstTok) + firstTok.length;
+          newPrompt = editArgs.substring(firstQuoteEnd).replace(/^["'\s]+/, "").replace(/["'\s]+$/, "").trim();
+        }
+      } else {
+        newPrompt = editArgs.replace(/^["']|["']$/g, "").trim();
+      }
+    }
+
+    const res = cronScheduler.editJob(id, {
+      cronExpression: newCron,
+      prompt: newPrompt,
+      name: newName,
+      timezone: newTz,
+      noAgent: newNoAgent,
+    });
+
+    if (!res.ok || !res.job) {
+      await ctx.reply(`⚠️ Failed to edit cron job: ${escapeHtml(res.error || "Unknown error")}`, { parse_mode: "HTML" });
+      return;
+    }
+
+    const nextRun = cronScheduler.getNextRun(res.job.id);
+    const replyMsg = [
+      `✅ <b>Cron Job Updated Successfully!</b>`,
+      `• <b>ID:</b> <code>${escapeHtml(res.job.id)}</code>`,
+      `• <b>Schedule:</b> <code>${escapeHtml(res.job.cronExpression)}</code>`,
+      `• <b>Next Run:</b> <code>${escapeHtml(nextRun || "N/A")}</code>`,
+      "",
+      "<b>Changes Applied:</b>",
+      ...(res.changes || []).map((c) => `• ${c}`),
+      "",
+      `Test now with: <code>/cron run ${escapeHtml(res.job.id)}</code>`,
+    ].join("\n");
+
+    await ctx.reply(replyMsg, { parse_mode: "HTML" });
+    return;
+  }
+
+  if (sub === "pause") {
+    if (!rest) {
+      await ctx.reply("⚠️ Please provide a job ID: <code>/cron pause &lt;id&gt;</code>", { parse_mode: "HTML" });
+      return;
+    }
+    const success = cronScheduler.pauseJob(rest);
+    if (success) {
+      await ctx.reply(`⏸️ Job <code>${escapeHtml(rest)}</code> paused.`, { parse_mode: "HTML" });
+    } else {
+      await ctx.reply(`⚠️ Job <code>${escapeHtml(rest)}</code> not found.`, { parse_mode: "HTML" });
+    }
+    return;
+  }
+
+  if (["resume", "unpause", "enable"].includes(sub)) {
+    if (!rest) {
+      await ctx.reply("⚠️ Please provide a job ID: <code>/cron resume &lt;id&gt;</code>", { parse_mode: "HTML" });
+      return;
+    }
+    const success = cronScheduler.resumeJob(rest);
+    if (success) {
+      await ctx.reply(
+        `▶️ Job <code>${escapeHtml(rest)}</code> resumed. Next run: <code>${escapeHtml(cronScheduler.getNextRun(rest) || "N/A")}</code>`,
+        { parse_mode: "HTML" }
+      );
+    } else {
+      await ctx.reply(`⚠️ Job <code>${escapeHtml(rest)}</code> not found.`, { parse_mode: "HTML" });
+    }
+    return;
+  }
+
+  if (sub === "run") {
+    if (!rest) {
+      await ctx.reply("⚠️ Please provide a job ID: <code>/cron run &lt;id&gt;</code>", { parse_mode: "HTML" });
+      return;
+    }
+    const job = cronScheduler.getJob(rest);
+    if (!job) {
+      await ctx.reply(`⚠️ Job <code>${escapeHtml(rest)}</code> not found.`, { parse_mode: "HTML" });
+      return;
+    }
+
+    await ctx.reply(`⏳ Executing scheduled job <code>${escapeHtml(job.name || job.id)}</code> now...`, { parse_mode: "HTML" });
+    try {
+      await cronScheduler.executeJob(job.id, true);
+    } catch (err: any) {
+      console.error("Manual execution error:", err);
+    }
+    return;
+  }
+
+  if (["logs", "log", "history"].includes(sub)) {
+    const jobLogs = cronScheduler.getLogs(rest || undefined, 5);
+    if (jobLogs.length === 0 || jobLogs.every((j) => j.logs.length === 0)) {
+      await ctx.reply("⏰ <b>No execution logs recorded yet.</b>\nLogs will appear after cron jobs execute.", {
+        parse_mode: "HTML",
+      });
+      return;
+    }
+
+    let msg = `📜 <b>Cron Execution History:</b>\n\n`;
+    for (const { job, logs } of jobLogs) {
+      if (logs.length === 0) continue;
+      const modeTag = job.noAgent ? "⚡ <i>Script</i>" : "🤖 <i>Agent</i>";
+      msg += `▪️ <b>${escapeHtml(job.name || job.id)}</b> [${modeTag}] (<code>${escapeHtml(job.id)}</code>):\n`;
+
+      for (const entry of logs.slice(-5).reverse()) {
+        const timeStr = new Date(entry.runAt).toLocaleString("id-ID", {
+          timeZone: job.timezone || "Asia/Jakarta",
+          dateStyle: "short",
+          timeStyle: "medium",
+        });
+        const statusIcon = entry.status === "success" ? "✅" : "❌";
+        const durationStr = `${(entry.durationMs / 1000).toFixed(2)}s`;
+
+        msg += `  ${statusIcon} <code>${escapeHtml(timeStr)}</code> (${durationStr})\n`;
+        if (entry.error) {
+          msg += `     <i>Error:</i> <code>${escapeHtml(entry.error.slice(0, 80))}</code>\n`;
+        } else if (entry.outputSnippet) {
+          const preview = escapeHtml(entry.outputSnippet.replace(/\n+/g, " ").slice(0, 60));
+          msg += `     <i>Result:</i> <code>${preview}...</code>\n`;
+        }
+      }
+      msg += "\n";
+    }
+
+    await ctx.reply(msg, { parse_mode: "HTML" });
+    return;
+  }
+
+  if (sub === "script" || sub === "add") {
+    const isExplicitScript = sub === "script" || rest.startsWith("--script ");
+    const cleanRest = rest.replace(/^--script\s+/, "").trim();
+
+    if (!cleanRest) {
+      await ctx.reply(
+        sub === "script"
+          ? '⚠️ Usage: <code>/cron script "&lt;cron_pattern&gt;" &lt;bash_command&gt;</code>\nExample: <code>/cron script "0 */2 * * *" termux-battery-status</code>'
+          : '⚠️ Usage: <code>/cron add "&lt;cron_pattern&gt;" &lt;prompt&gt;</code>\nExample: <code>/cron add "0 8 * * *" Check battery and news</code>',
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    // Parse tokens
+    const tokens: string[] = [];
+    const regex = /\"([^\"]*)\"|'([^']*)'|(\S+)/g;
+    let match: RegExpExecArray | null;
+    while ((match = regex.exec(cleanRest)) !== null) {
+      const val = match[1] ?? match[2] ?? match[3];
+      if (val !== undefined && val.trim().length > 0) {
+        tokens.push(val.trim());
+      }
+    }
+
+    const firstToken = tokens[0];
+    const secondToken = tokens[1];
+
+    if (!firstToken || !secondToken) {
+      await ctx.reply(
+        '⚠️ Invalid format. Usage: <code>/cron add "&lt;cron_pattern&gt;" &lt;prompt&gt;</code>\nExample: <code>/cron add "0 8 * * *" Check battery and news</code>',
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    const isCronPart = (s: string) => s.split(" ").length >= 5 || s.includes("*") || s.startsWith("@");
+    let id: string | undefined;
+    let cronExpression: string;
+    let prompt: string;
+
+    if (isCronPart(firstToken)) {
+      cronExpression = firstToken;
+      const firstQuoteEnd = cleanRest.indexOf(firstToken) + firstToken.length;
+      prompt = cleanRest.substring(firstQuoteEnd).replace(/^[\"'\s]+/, "").replace(/[\"'\s]+$/, "").trim();
+      if (!prompt && tokens.length > 1) {
+        prompt = tokens.slice(1).join(" ");
+      }
+    } else if (tokens.length >= 3 && secondToken && isCronPart(secondToken)) {
+      id = firstToken;
+      cronExpression = secondToken;
+      const secondQuoteEnd = cleanRest.indexOf(secondToken) + secondToken.length;
+      prompt = cleanRest.substring(secondQuoteEnd).replace(/^[\"'\s]+/, "").replace(/[\"'\s]+$/, "").trim();
+      if (!prompt && tokens.length > 2) {
+        prompt = tokens.slice(2).join(" ");
+      }
+    } else {
+      cronExpression = firstToken;
+      prompt = tokens.slice(1).join(" ");
+    }
+
+    if (!prompt) {
+      await ctx.reply("⚠️ Please provide a prompt or command for the task to execute.", { parse_mode: "HTML" });
+      return;
+    }
+
+    const result = cronScheduler.addJob({
+      id,
+      cronExpression,
+      prompt,
+      chatId,
+      noAgent: isExplicitScript,
+    });
+
+    if (!result.ok || !result.job) {
+      await ctx.reply(`⚠️ Failed to add cron job: ${escapeHtml(result.error || "Unknown error")}`, { parse_mode: "HTML" });
+      return;
+    }
+
+    const nextRun = cronScheduler.getNextRun(result.job.id);
+    const modeBadge = isExplicitScript ? "⚡ <b>Direct Script (No LLM Tokens)</b>" : "🤖 <b>Agent Reasoning</b>";
+    const successMsg = [
+      `✅ <b>Cron Job Added Successfully!</b>`,
+      `• <b>ID:</b> <code>${escapeHtml(result.job.id)}</code>`,
+      `• <b>Mode:</b> ${modeBadge}`,
+      `• <b>Schedule:</b> <code>${escapeHtml(result.job.cronExpression)}</code>`,
+      `• <b>Next Run:</b> <code>${escapeHtml(nextRun || "N/A")}</code>`,
+      `• <b>${isExplicitScript ? "Command:" : "Prompt:"}</b> <i>${escapeHtml(result.job.prompt)}</i>`,
+      "",
+      `Test immediately with: <code>/cron run ${escapeHtml(result.job.id)}</code>`,
+    ].join("\n");
+
+    await ctx.reply(successMsg, { parse_mode: "HTML" });
+    return;
+  }
+
+  await ctx.reply(`⚠️ Unknown cron subcommand: <code>${escapeHtml(sub)}</code>.\nUse <code>/cron help</code> to see available commands.`, { parse_mode: "HTML" });
+});
+
+// Command: /model
+bot.command("model", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return;
+
+  const text = ctx.message?.text || "";
+  const parts = text.split(" ").slice(1);
+  const targetModel = parts.join(" ").trim();
+
+  if (targetModel) {
+    // Switch model
+    try {
+      const switched = await sessionPool.setModel(chatId, targetModel);
+      if (switched) {
+        await ctx.reply(`✅ Switched model to: <code>${escapeHtml(`${switched.provider}/${switched.id}`)}</code>`, {
+          parse_mode: "HTML",
+        });
+      } else {
+        await ctx.reply(
+          `⚠️ Could not find model: <code>${escapeHtml(targetModel)}</code>. Use <code>/model</code> to view available models.`,
+          { parse_mode: "HTML" }
+        );
+      }
+    } catch (err: any) {
+      await ctx.reply(`⚠️ Error switching model: ${escapeHtml(err.message)}`, { parse_mode: "HTML" });
+    }
+    return;
+  }
+
+  // List models
+  try {
+    const entry = await sessionPool.getSession(chatId);
+    const currentModel = entry.session.model;
+    const services = sessionPool.getServices();
+    const modelRuntime = services?.modelRuntime;
+    const available = modelRuntime ? await modelRuntime.getAvailable() : [];
+
+    let msg = `🤖 <b>Current Model:</b> <code>${escapeHtml(currentModel ? `${currentModel.provider}/${currentModel.id}` : "default")}</code>\n\n`;
+
+    if (available.length > 0) {
+      msg += `<b>Available Models (${available.length} total):</b>\n`;
+      for (const m of available.slice(0, 10)) {
+        msg += `• <code>${escapeHtml(`${m.provider}/${m.id}`)}</code>\n`;
+      }
+      if (available.length > 10) {
+        msg += `<i>...and ${available.length - 10} more</i>\n`;
+      }
+      msg += `\nSwitch with: <code>/model &lt;provider/model-id&gt;</code>`;
+    } else {
+      msg += `<i>No configured models found.</i>`;
+    }
+
+    await ctx.reply(msg, { parse_mode: "HTML" });
+  } catch (err: any) {
+    await ctx.reply(`⚠️ Error fetching models: ${escapeHtml(err.message)}`, { parse_mode: "HTML" });
+  }
+});
+
+// Helper: Download and extract images/files from Telegram messages
+interface ExtractedUserInput {
+  text: string;
+  images: Array<{ type: "image"; mimeType: string; data: string }>;
+  savedPaths: string[];
+}
+
+async function extractUserInput(ctx: Context): Promise<ExtractedUserInput> {
+  const images: Array<{ type: "image"; mimeType: string; data: string }> = [];
+  const savedPaths: string[] = [];
+  let text = ctx.message?.text || ctx.message?.caption || "";
+
+  // 1. Photo (Compressed Telegram Image)
+  if (ctx.message?.photo && ctx.message.photo.length > 0) {
+    try {
+      const photos = ctx.message.photo;
+      const photo = photos[photos.length - 1];
+      if (photo?.file_id) {
+        const file = await ctx.api.getFile(photo.file_id);
+        if (file.file_path) {
+          const fileUrl = `https://api.telegram.org/file/bot${config.botToken}/${file.file_path}`;
+          const res = await fetch(fileUrl);
+          if (res.ok) {
+            const buffer = Buffer.from(await res.arrayBuffer());
+            const ext = path.extname(file.file_path) || ".jpg";
+            const mimeType = ext.toLowerCase() === ".png" ? "image/png" : ext.toLowerCase() === ".webp" ? "image/webp" : "image/jpeg";
+
+            images.push({
+              type: "image",
+              mimeType,
+              data: buffer.toString("base64"),
+            });
+
+            const imgDir = path.join(config.sessionsDir, "images");
+            if (!fs.existsSync(imgDir)) fs.mkdirSync(imgDir, { recursive: true });
+            const localPath = path.join(imgDir, `photo_${Date.now()}_${photo.file_id.slice(0, 8)}${ext}`);
+            fs.writeFileSync(localPath, buffer);
+            savedPaths.push(localPath);
+          }
+        }
+      }
+    } catch (err: any) {
+      console.error("Error downloading photo from Telegram:", err.message);
+    }
+  }
+
+  // 2. Document (Uncompressed Image)
+  if (ctx.message?.document) {
+    const doc = ctx.message.document;
+    const mime = doc.mime_type || "";
+    if (mime.startsWith("image/")) {
+      try {
+        const file = await ctx.api.getFile(doc.file_id);
+        if (file.file_path) {
+          const fileUrl = `https://api.telegram.org/file/bot${config.botToken}/${file.file_path}`;
+          const res = await fetch(fileUrl);
+          if (res.ok) {
+            const buffer = Buffer.from(await res.arrayBuffer());
+            const ext = path.extname(doc.file_name || file.file_path) || (mime === "image/png" ? ".png" : ".jpg");
+
+            images.push({
+              type: "image",
+              mimeType: mime,
+              data: buffer.toString("base64"),
+            });
+
+            const imgDir = path.join(config.sessionsDir, "images");
+            if (!fs.existsSync(imgDir)) fs.mkdirSync(imgDir, { recursive: true });
+            const localPath = path.join(imgDir, `doc_${Date.now()}_${doc.file_name || "image" + ext}`);
+            fs.writeFileSync(localPath, buffer);
+            savedPaths.push(localPath);
+          }
+        }
+      } catch (err: any) {
+        console.error("Error downloading document image from Telegram:", err.message);
+      }
+    }
+  }
+
+  if (!text.trim() && images.length > 0) {
+    text = "Tolong periksa dan analisis gambar ini, jelaskan isi atau jawab detail terkait gambar tersebut.";
+  }
+
+  if (savedPaths.length > 0 && text.trim()) {
+    const pathsNote = savedPaths.map((p) => `[File gambar disimpan di: ${p}]`).join("\n");
+    text = `${text}\n\n${pathsNote}`;
+  }
+
+  return { text, images, savedPaths };
+}
+
+// Main Message Handler (with Follow-Up Queueing & Multi-turn streaming)
+bot.on(["message:text", "message:photo", "message:document"], async (ctx) => {
+  const chatId = ctx.chat.id;
+  const input = await extractUserInput(ctx);
+  if (!input.text.trim() && input.images.length === 0) return;
+  const userText = input.text;
+
+  // Ignore commands handled above
+  if (userText.startsWith("/")) return;
+
+  const entry = await sessionPool.getSession(chatId);
+
+  // 1. If agent is ALREADY busy processing: Queue as Follow-Up!
+  if (entry.isProcessing || entry.session.isStreaming) {
+    try {
+      await entry.session.followUp(
+        input.text,
+        input.images.length > 0 ? (input.images as any) : undefined
+      );
+      const preview = escapeHtml(userText.length > 80 ? userText.slice(0, 77) + "..." : userText);
+      await ctx.reply(
+        `📥 <b>Queued Follow-up:</b> <i>"${preview}"</i>\nPi will execute this automatically as soon as the current task finishes.`,
+        { parse_mode: "HTML" }
+      );
+    } catch (err: any) {
+      await ctx.reply(`⚠️ Could not queue follow-up: ${escapeHtml(err.message)}`, { parse_mode: "HTML" });
+    }
+    return;
+  }
+
+  // 2. Start a fresh prompt turn
+  entry.isProcessing = true;
+  entry.aborted = false;
+  const turnStartTime = Date.now();
+
+  console.log(`📩 [Telegram] Prompt from ${ctx.from?.id}: "${input.text.slice(0, 60)}"${input.images.length > 0 ? ` (+${input.images.length} images)` : ""}`);
+
+  // Keep sending typing action every 4 seconds while running
+  const typingInterval = setInterval(() => {
+    ctx.replyWithChatAction("typing").catch(() => {});
+  }, 4000);
+  ctx.replyWithChatAction("typing").catch(() => {});
+
+  let fullResponse = "";
+  let modelErrorMessage: string | null = null;
+  let statusMessageId: number | null = null;
+  const toolLog: string[] = [];
+
+  // Throttled tool status updates (avoids Telegram 429 Flood Control)
+  let lastStatusEdit = 0;
+  let pendingStatusTimer: any = null;
+
+  const flushStatusUpdate = async () => {
+    if (pendingStatusTimer) {
+      clearTimeout(pendingStatusTimer);
+      pendingStatusTimer = null;
+    }
+    const preview = toolLog.slice(-3).join("\n");
+    const statusHtml = `⚙️ <b>Executing Tools:</b>\n${preview}`;
+    try {
+      if (!statusMessageId) {
+        const sent = await ctx.reply(statusHtml, { parse_mode: "HTML" });
+        statusMessageId = sent.message_id;
+      } else {
+        await ctx.api.editMessageText(chatId, statusMessageId, statusHtml, { parse_mode: "HTML" });
+      }
+      lastStatusEdit = Date.now();
+    } catch {
+      // Ignore intermediate UI edit errors
+    }
+  };
+
+  const scheduleStatusUpdate = () => {
+    const now = Date.now();
+    if (now - lastStatusEdit >= 1500) {
+      flushStatusUpdate();
+    } else if (!pendingStatusTimer) {
+      pendingStatusTimer = setTimeout(flushStatusUpdate, 1500 - (now - lastStatusEdit));
+    }
+  };
+
+  const unsubscribe = entry.session.subscribe(async (event) => {
+    try {
+      if (event.type === "message_update") {
+        if (event.assistantMessageEvent.type === "text_delta") {
+          fullResponse += event.assistantMessageEvent.delta;
+        }
+      } else if (event.type === "message_end") {
+        if (event.message?.role === "assistant") {
+          if (event.message.errorMessage) {
+            modelErrorMessage = event.message.errorMessage;
+          }
+          if (!fullResponse && event.message.content) {
+            const texts = event.message.content
+              .filter((c: any) => c.type === "text")
+              .map((c: any) => c.text)
+              .join("\n");
+            if (texts) fullResponse = texts;
+          }
+        }
+      } else if (event.type === "agent_end") {
+        const lastMsg = event.messages?.[event.messages.length - 1];
+        if (lastMsg?.role === "assistant" && lastMsg.errorMessage) {
+          modelErrorMessage = lastMsg.errorMessage;
+        }
+      } else if (event.type === "tool_execution_start") {
+        const line = formatToolStatus(event.toolName, event.args);
+        console.log(`⚙️ [Tool Call] ${event.toolName}: ${JSON.stringify(event.args || {})}`);
+        toolLog.push(line);
+        scheduleStatusUpdate();
+      }
+    } catch {
+      // Ignore intermediate streaming errors
+    }
+  });
+
+  try {
+    await entry.session.prompt(input.text, { images: input.images.length > 0 ? (input.images as any) : undefined });
+
+    // If aborted mid-flight, immediately exit cleanly
+    if (entry.aborted) {
+      if (statusMessageId) {
+        const msgIdToDelete = statusMessageId;
+        statusMessageId = null;
+        await ctx.api.deleteMessage(chatId, msgIdToDelete).catch(() => {});
+      }
+      return;
+    }
+
+    // Clean up status message if exists
+    if (statusMessageId) {
+      const msgIdToDelete = statusMessageId;
+      statusMessageId = null;
+      await ctx.api.deleteMessage(chatId, msgIdToDelete).catch(() => {});
+    }
+
+    if (modelErrorMessage) {
+      await ctx.reply(`❌ <b>Model Error:</b>\n<pre>${escapeHtml(modelErrorMessage)}</pre>`, {
+        parse_mode: "HTML",
+      });
+      return;
+    }
+
+    if (!fullResponse || !fullResponse.trim()) {
+      fullResponse = "*(Completed with no text output)*";
+    }
+
+    const elapsedSec = ((Date.now() - turnStartTime) / 1000).toFixed(2);
+    console.log(`✅ [Prompt Turn Complete] Finished in ${elapsedSec}s. Output length: ${fullResponse.length} chars.`);
+
+    // Convert LLM / CLI Markdown to clean Telegram HTML and split safely
+    const htmlContent = markdownToTelegramHtml(fullResponse);
+    const chunks = splitMessage(htmlContent);
+
+    for (const chunk of chunks) {
+      try {
+        await ctx.reply(chunk, { parse_mode: "HTML" });
+      } catch (tgErr: any) {
+        console.error("HTML send error, falling back to plain text:", tgErr.message);
+        await ctx.reply(chunk.replace(/<[^>]*>/g, ""));
+      }
+    }
+  } catch (err: any) {
+    if (statusMessageId) {
+      await ctx.api.deleteMessage(chatId, statusMessageId).catch(() => {});
+    }
+    if (!entry.aborted) {
+      await ctx.reply(`❌ <b>Execution Error:</b>\n<pre>${escapeHtml(err.message)}</pre>`, {
+        parse_mode: "HTML",
+      });
+    }
+  } finally {
+    clearInterval(typingInterval);
+    if (pendingStatusTimer) clearTimeout(pendingStatusTimer);
+    unsubscribe();
+    entry.isProcessing = false;
+  }
+});
+
+// Global Error handling
+bot.catch((err) => {
+  const ctx = err.ctx;
+  console.error(`[Telegram Error] on update ${ctx?.update?.update_id}:`, err.error);
+});
+
+// Launch Gateway with auto-reconnecting resilience
+async function main() {
+  // Check if an instance is already running
+  const lock = SingleInstanceGuard.acquire();
+  if (!lock.acquired) {
+    console.log("\n=======================================================");
+    console.log("⚠️  PI TELEGRAM GATEWAY IS ALREADY RUNNING!");
+    console.log(`🆔 Active Process PID: ${lock.existingPid}`);
+    console.log("=======================================================");
+    console.log("💡 Useful commands:");
+    console.log("   • View live metrics: npm run status");
+    console.log("   • Restart gateway:   npm run restart");
+    console.log(`   • Stop gateway:      kill ${lock.existingPid}\n`);
+    process.exit(0);
+  }
+
+  console.log("Initializing Pi Session Services (extensions, skills, models)...");
+  await sessionPool.init();
+
+  console.log("Initializing Cron Scheduler...");
+  cronScheduler.init(bot);
+
+  // Graceful shutdown handling
+  const shutdown = async () => {
+    console.log("\n🛑 Stopping Pi Telegram Gateway...");
+    SingleInstanceGuard.release();
+    healthMonitor.destroy();
+    cronScheduler.destroy();
+    sessionPool.destroy();
+    try {
+      await bot.stop();
+    } catch {}
+    process.exit(0);
+  };
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
+
+  console.log("Starting Pi Telegram Gateway...");
+
+  let retryDelay = 2000;
+  while (true) {
+    try {
+      await bot.start({
+        drop_pending_updates: true,
+        onStart: (botInfo) => {
+          healthMonitor.init(botInfo);
+          console.log(`🚀 Pi Telegram Gateway active as @${botInfo.username}`);
+          console.log(`📁 Working Directory: ${config.defaultCwd}`);
+          console.log(`💾 Sessions Directory: ${config.sessionsDir}`);
+          if (config.allowedUsers.length > 0) {
+            console.log(`🔒 Allowed User IDs: ${config.allowedUsers.join(", ")}`);
+          } else {
+            console.log("⚠️ No ALLOWED_USERS configured (open to any Telegram user)");
+          }
+        },
+      });
+      break;
+    } catch (err: any) {
+      console.error(`⚠️ Network polling error (${err.message}). Auto-reconnecting in ${retryDelay / 1000}s...`);
+      await new Promise((resolve) => setTimeout(resolve, retryDelay));
+      retryDelay = Math.min(retryDelay * 1.5, 30000);
+    }
+  }
+}
+
+// Global Process Exception Protection (Prevents daemon crashes on transient network drops)
+process.on("unhandledRejection", (reason: any) => {
+  console.error("⚠️ [Process Unhandled Rejection]:", reason?.message || reason);
+});
+
+process.on("uncaughtException", (err: Error) => {
+  console.error("⚠️ [Process Uncaught Exception]:", err.message, err.stack);
+});
+
+main().catch((err) => {
+  console.error("Fatal startup error:", err);
+  process.exit(1);
+});
