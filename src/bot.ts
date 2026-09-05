@@ -1130,7 +1130,7 @@ bot.on(["message:text", "message:photo", "message:document"], async (ctx) => {
   let fullResponse = "";
   let modelErrorMessage: string | null = null;
   let statusMessageId: number | null = null;
-  let deliveredResponse = false;
+  const conversationalResponses: string[] = [];
   const toolLog: string[] = [];
 
   // Helper to safely send a completed turn message to Telegram
@@ -1197,29 +1197,13 @@ bot.on(["message:text", "message:photo", "message:document"], async (ctx) => {
           if (event.message.errorMessage) {
             modelErrorMessage = event.message.errorMessage;
           }
-          if (!fullResponse && event.message.content) {
-            const texts = event.message.content
-              .filter((c: any) => c.type === "text")
-              .map((c: any) => c.text)
-              .join("\n");
-            if (texts) fullResponse = texts;
-          }
-        }
-      } else if (event.type === "turn_end") {
-        // When a turn ends without tool calls, it produced a conversational response for that turn!
-        if (event.toolResults.length === 0) {
-          let textToSend = fullResponse;
-          if (!textToSend && event.message?.role === "assistant" && (event.message as any).content) {
-            textToSend = (event.message as any).content
-              .filter((c: any) => c.type === "text")
-              .map((c: any) => c.text)
-              .join("\n");
-          }
-          if (textToSend && textToSend.trim()) {
-            await sendTurnResponse(textToSend);
-            deliveredResponse = true;
-            fullResponse = "";
-            toolLog.length = 0;
+          const content = (event.message as any).content;
+          const hasToolCalls = Array.isArray(content) && content.some((c: any) => c.type === "toolCall");
+          const text = Array.isArray(content)
+            ? content.filter((c: any) => c.type === "text").map((c: any) => c.text).join("\n").trim()
+            : "";
+          if (!hasToolCalls && text) {
+            conversationalResponses.push(text);
           }
         }
       } else if (event.type === "agent_end") {
@@ -1265,12 +1249,15 @@ bot.on(["message:text", "message:photo", "message:document"], async (ctx) => {
       return;
     }
 
-    // If turn_end already delivered the message(s), we're all set!
-    if (!deliveredResponse) {
-      if (!fullResponse || !fullResponse.trim()) {
-        fullResponse = "*(Completed with no text output)*";
+    // Deliver all completed conversational responses deterministically (prevents duplicate sends)
+    if (conversationalResponses.length > 0) {
+      for (const resp of conversationalResponses) {
+        await sendTurnResponse(resp);
       }
+    } else if (fullResponse && fullResponse.trim()) {
       await sendTurnResponse(fullResponse);
+    } else {
+      await sendTurnResponse("*(Completed with no text output)*");
     }
 
     const elapsedSec = ((Date.now() - turnStartTime) / 1000).toFixed(2);
