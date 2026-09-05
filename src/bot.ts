@@ -1222,56 +1222,102 @@ bot.on(["message:text", "message:photo", "message:document"], async (ctx) => {
     }
   });
 
-  try {
-    await entry.session.prompt(input.text, { images: input.images.length > 0 ? (input.images as any) : undefined });
+  const isTransientNetworkError = (msg: string | null | undefined): boolean => {
+    if (!msg) return false;
+    const lower = msg.toLowerCase();
+    return (
+      lower.includes("socket connection was closed") ||
+      lower.includes("fetch failed") ||
+      lower.includes("econnreset") ||
+      lower.includes("etimedout") ||
+      lower.includes("socket hang up") ||
+      lower.includes("network error") ||
+      lower.includes("terminated")
+    );
+  };
 
-    // If aborted mid-flight, immediately exit cleanly
-    if (entry.aborted) {
+  try {
+    let retryCount = 0;
+    const maxRetries = 1;
+
+    while (retryCount <= maxRetries) {
+    try {
+      await entry.session.prompt(input.text, { images: input.images.length > 0 ? (input.images as any) : undefined });
+
+      // If aborted mid-flight, immediately exit cleanly
+      if (entry.aborted) {
+        if (statusMessageId) {
+          const msgIdToDelete = statusMessageId;
+          statusMessageId = null;
+          await ctx.api.deleteMessage(chatId, msgIdToDelete).catch(() => {});
+        }
+        return;
+      }
+
+      // Check if transient network drop happened on model stream
+      if (modelErrorMessage && isTransientNetworkError(modelErrorMessage) && retryCount < maxRetries) {
+        console.warn(
+          `⚠️ Transient socket drop: "${modelErrorMessage}". Auto-retrying prompt in 2.5s (attempt ${retryCount + 1}/${maxRetries})...`
+        );
+        retryCount++;
+        modelErrorMessage = null;
+        fullResponse = "";
+        conversationalResponses.length = 0;
+        await new Promise((resolve) => setTimeout(resolve, 2500));
+        continue;
+      }
+
+      // Clean up status message if exists
       if (statusMessageId) {
         const msgIdToDelete = statusMessageId;
         statusMessageId = null;
         await ctx.api.deleteMessage(chatId, msgIdToDelete).catch(() => {});
       }
-      return;
-    }
 
-    // Clean up status message if exists
-    if (statusMessageId) {
-      const msgIdToDelete = statusMessageId;
-      statusMessageId = null;
-      await ctx.api.deleteMessage(chatId, msgIdToDelete).catch(() => {});
-    }
-
-    if (modelErrorMessage) {
-      await ctx.reply(`❌ <b>Model Error:</b>\n<pre>${escapeHtml(modelErrorMessage)}</pre>`, {
-        parse_mode: "HTML",
-      });
-      return;
-    }
-
-    // Deliver all completed conversational responses deterministically (prevents duplicate sends)
-    if (conversationalResponses.length > 0) {
-      for (const resp of conversationalResponses) {
-        await sendTurnResponse(resp);
+      if (modelErrorMessage) {
+        await ctx.reply(`❌ <b>Model Error:</b>\n<pre>${escapeHtml(modelErrorMessage)}</pre>`, {
+          parse_mode: "HTML",
+        });
+        return;
       }
-    } else if (fullResponse && fullResponse.trim()) {
-      await sendTurnResponse(fullResponse);
-    } else {
-      await sendTurnResponse("*(Completed with no text output)*");
-    }
 
-    const elapsedSec = ((Date.now() - turnStartTime) / 1000).toFixed(2);
-    console.log(`✅ [Prompt Turn Complete] Finished in ${elapsedSec}s.`);
-  } catch (err: any) {
-    if (statusMessageId) {
-      await ctx.api.deleteMessage(chatId, statusMessageId).catch(() => {});
+      // Deliver all completed conversational responses deterministically (prevents duplicate sends)
+      if (conversationalResponses.length > 0) {
+        for (const resp of conversationalResponses) {
+          await sendTurnResponse(resp);
+        }
+      } else if (fullResponse && fullResponse.trim()) {
+        await sendTurnResponse(fullResponse);
+      } else {
+        await sendTurnResponse("*(Completed with no text output)*");
+      }
+
+      const elapsedSec = ((Date.now() - turnStartTime) / 1000).toFixed(2);
+      console.log(`✅ [Prompt Turn Complete] Finished in ${elapsedSec}s.`);
+      break;
+    } catch (err: any) {
+      if (isTransientNetworkError(err?.message) && retryCount < maxRetries) {
+        console.warn(`⚠️ Transient socket error caught: "${err.message}". Auto-retrying in 2.5s...`);
+        retryCount++;
+        modelErrorMessage = null;
+        fullResponse = "";
+        conversationalResponses.length = 0;
+        await new Promise((resolve) => setTimeout(resolve, 2500));
+        continue;
+      }
+
+      if (statusMessageId) {
+        await ctx.api.deleteMessage(chatId, statusMessageId).catch(() => {});
+      }
+      if (!entry.aborted) {
+        await ctx.reply(`❌ <b>Execution Error:</b>\n<pre>${escapeHtml(err.message)}</pre>`, {
+          parse_mode: "HTML",
+        });
+      }
+      break;
     }
-    if (!entry.aborted) {
-      await ctx.reply(`❌ <b>Execution Error:</b>\n<pre>${escapeHtml(err.message)}</pre>`, {
-        parse_mode: "HTML",
-      });
-    }
-  } finally {
+  }
+} finally {
     clearInterval(typingInterval);
     if (pendingStatusTimer) clearTimeout(pendingStatusTimer);
     unsubscribe();
