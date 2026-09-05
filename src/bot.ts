@@ -3,6 +3,7 @@ import fs from "fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { Bot, Context } from "grammy";
+import { run, type RunnerHandle } from "@grammyjs/runner";
 
 const execFileAsync = promisify(execFile);
 import { config } from "./config";
@@ -1319,43 +1320,54 @@ async function main() {
   console.log("Initializing Cron Scheduler...");
   cronScheduler.init(bot);
 
-  // Graceful shutdown handling
-  const shutdown = async () => {
-    console.log("\n🛑 Stopping Pi Telegram Gateway...");
-    SingleInstanceGuard.release();
-    healthMonitor.destroy();
-    cronScheduler.destroy();
-    sessionPool.destroy();
-    try {
-      await bot.stop();
-    } catch {}
-    process.exit(0);
-  };
-  process.once("SIGINT", shutdown);
-  process.once("SIGTERM", shutdown);
+  console.log("Starting Pi Telegram Gateway with Concurrent Runner...");
 
-  console.log("Starting Pi Telegram Gateway...");
-
+  let runner: RunnerHandle | null = null;
   let retryDelay = 2000;
   while (true) {
     try {
-      await bot.start({
-        drop_pending_updates: true,
-        onStart: (botInfo) => {
-          healthMonitor.init(botInfo);
-          console.log(`🚀 Pi Telegram Gateway active as @${botInfo.username}`);
-          console.log(`📁 Working Directory: ${config.defaultCwd}`);
-          console.log(`💾 Sessions Directory: ${config.sessionsDir}`);
-          if (config.allowedUsers.length > 0) {
-            console.log(`🔒 Allowed User IDs: ${config.allowedUsers.join(", ")}`);
-          } else {
-            console.log("⚠️ No ALLOWED_USERS configured (open to any Telegram user)");
-          }
+      await bot.api.deleteWebhook({ drop_pending_updates: true });
+      await bot.init();
+      const botInfo = bot.botInfo;
+      healthMonitor.init(botInfo);
+      console.log(`🚀 Pi Telegram Gateway active as @${botInfo.username}`);
+      console.log(`📂 Working Directory: ${config.defaultCwd}`);
+      console.log(`💾 Sessions Directory: ${config.sessionsDir}`);
+      if (config.allowedUsers.length > 0) {
+        console.log(`🔐 Allowed User IDs: ${config.allowedUsers.join(", ")}`);
+      } else {
+        console.log("⚠️ No ALLOWED_USERS configured (open to any Telegram user)");
+      }
+
+      runner = run(bot, {
+        runner: {
+          fetch: {
+            timeout: 30,
+          },
         },
       });
+
+      // Graceful shutdown handling
+      const shutdown = async () => {
+        console.log("\n🛑 Stopping Pi Telegram Gateway...");
+        SingleInstanceGuard.release();
+        healthMonitor.destroy();
+        cronScheduler.destroy();
+        sessionPool.destroy();
+        try {
+          if (runner && runner.isRunning()) {
+            await runner.stop();
+          }
+        } catch {}
+        process.exit(0);
+      };
+      process.once("SIGINT", shutdown);
+      process.once("SIGTERM", shutdown);
+
+      await runner.task();
       break;
     } catch (err: any) {
-      console.error(`⚠️ Network polling error (${err.message}). Auto-reconnecting in ${retryDelay / 1000}s...`);
+      console.error(`⚠️ Network / Runner error (${err.message}). Auto-reconnecting in ${retryDelay / 1000}s...`);
       await new Promise((resolve) => setTimeout(resolve, retryDelay));
       retryDelay = Math.min(retryDelay * 1.5, 30000);
     }
