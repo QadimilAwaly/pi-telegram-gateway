@@ -66,7 +66,43 @@ export class GatewayLogger {
       this.write("ERROR", args);
     };
 
+    // Load existing recent logs from disk on startup
+    this.loadExistingLogsFromFile();
+
     this.info("GatewayLogger initialized. Capturing stdout & stderr to " + this.logFile);
+  }
+
+  private loadExistingLogsFromFile(maxLines: number = 200) {
+    try {
+      if (!fs.existsSync(this.logFile)) return;
+      const content = fs.readFileSync(this.logFile, "utf-8");
+      const lines = content.split("\n").filter((l) => l.trim().length > 0);
+      const recentLines = lines.slice(-maxLines);
+
+      for (const line of recentLines) {
+        const match = line.match(/^\[(.*?)\]\s+\[(INFO|WARN|ERROR|DEBUG)\]\s+(.*)$/);
+        if (match) {
+          this.ringBuffer.push({
+            timestamp: Date.now(),
+            timeStr: match[1] || "",
+            level: (match[2] as LogLevel) || "INFO",
+            message: match[3] || "",
+          });
+        } else {
+          this.ringBuffer.push({
+            timestamp: Date.now(),
+            timeStr: "",
+            level: "INFO",
+            message: line,
+          });
+        }
+      }
+
+      // Keep within maxRingBufferSize
+      if (this.ringBuffer.length > this.maxRingBufferSize) {
+        this.ringBuffer = this.ringBuffer.slice(-this.maxRingBufferSize);
+      }
+    } catch {}
   }
 
   private formatArgs(args: any[]): string {
@@ -161,6 +197,12 @@ export class GatewayLogger {
   getRecentLogs(options: { limit?: number; level?: LogLevel | "ALL" } = {}): LogEntry[] {
     const limit = Math.min(options.limit || 20, 100);
     const level = options.level || "ALL";
+
+    // If buffer has fewer items than requested, reload from persistent log file
+    if (this.ringBuffer.length < limit && fs.existsSync(this.logFile)) {
+      this.ringBuffer = [];
+      this.loadExistingLogsFromFile(Math.max(limit * 2, 200));
+    }
 
     let filtered = this.ringBuffer;
     if (level !== "ALL") {
