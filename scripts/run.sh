@@ -6,6 +6,8 @@
 DIR="/data/data/com.termux/files/home/pi-telegram-gateway"
 LOCK_FILE="/data/data/com.termux/files/home/.pi/telegram-sessions/gateway.lock"
 
+export PATH="/data/data/com.termux/files/home/.bun/bin:/data/data/com.termux/files/usr/bin:$PATH"
+
 cd "$DIR" || exit 1
 
 # 1. Check if an instance is already running before starting

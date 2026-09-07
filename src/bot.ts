@@ -2,7 +2,7 @@ import path from "path";
 import fs from "fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { Bot, Context } from "grammy";
+import { Bot, Context, InlineKeyboard } from "grammy";
 import { run, type RunnerHandle } from "@grammyjs/runner";
 
 const execFileAsync = promisify(execFile);
@@ -56,6 +56,7 @@ bot.command("start", async (ctx) => {
     "<b>Commands:</b>",
     "• <code>/help</code> — Show command guide",
     "• <code>/new</code> or <code>/reset</code> — Start a fresh conversation session",
+    "• <code>/resume</code> — Switch or restore a previous session",
     "• <code>/status</code> — View current model and session info",
     "• <code>/model [name]</code> — View or switch model",
     "• <code>/steer &lt;text&gt;</code> — Steer/redirect active agent execution",
@@ -81,6 +82,7 @@ bot.command("help", async (ctx) => {
     "• <b>Follow-up Queueing:</b> If you send a message while Pi is busy, it is automatically queued as a follow-up task!",
     "• <code>/steer &lt;instruction&gt;</code> — Redirect or modify the active agent's plan mid-flight.",
     "• <code>/new</code> or <code>/reset</code> — Clear current session and start fresh.",
+    "• <code>/resume</code> or <code>/sessions</code> — Browse and switch back to previous sessions.",
     "• <code>/status</code> — Check current session ID, model, and message count.",
     "• <code>/model</code> — Show active model and available alternatives.",
     "• <code>/model &lt;provider/name&gt;</code> — Switch active model for this chat.",
@@ -113,6 +115,133 @@ const handleReset = async (ctx: Context) => {
 };
 bot.command("new", handleReset);
 bot.command("reset", handleReset);
+
+// Command: /resume & /sessions
+const handleResume = async (ctx: Context) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return;
+
+  const text = ctx.message?.text || "";
+  const rawArg = text.replace(/^\/(?:resume|sessions|session)\s*/i, "").trim();
+
+  // If specific session identifier or index provided (e.g. /resume 2 or /resume 01a069ea)
+  if (rawArg) {
+    await ctx.replyWithChatAction("typing");
+    try {
+      const res = await sessionPool.resumeSession(chatId, rawArg);
+      if (res.alreadyActive) {
+        await ctx.reply(
+          `ℹ️ Session <code>${escapeHtml(res.session.sessionId)}</code> is already the active session.\n• <b>Messages:</b> ${res.messageCount}\n• <b>Topic:</b> <i>${escapeHtml(res.summary)}</i>`,
+          { parse_mode: "HTML" }
+        );
+        return;
+      }
+      const reply = [
+        `🔄 <b>Session Resumed!</b>`,
+        `• <b>Session ID:</b> <code>${escapeHtml(res.session.sessionId)}</code>`,
+        `• <b>Restored:</b> <code>${res.messageCount}</code> messages`,
+        `• <b>Topic:</b> <i>${escapeHtml(res.summary)}</i>`,
+        "",
+        "You can now continue this conversation seamlessly!",
+      ].join("\n");
+      await ctx.reply(reply, { parse_mode: "HTML" });
+    } catch (err: any) {
+      await ctx.reply(`⚠️ Failed to resume session: ${escapeHtml(err.message)}`, { parse_mode: "HTML" });
+    }
+    return;
+  }
+
+  // Interactive picker without argument
+  await ctx.replyWithChatAction("typing");
+  try {
+    const sessions = await sessionPool.listSessions(chatId);
+    if (sessions.length === 0) {
+      await ctx.reply("ℹ️ No previous sessions found for this chat. Start chatting or use <code>/new</code>.", {
+        parse_mode: "HTML",
+      });
+      return;
+    }
+
+    let msg = "🔄 <b>Session Switcher & History</b>\n\n";
+    const keyboard = new InlineKeyboard();
+
+    const maxDisplay = Math.min(sessions.length, 6);
+    for (let i = 0; i < maxDisplay; i++) {
+      const s = sessions[i];
+      if (!s) continue;
+      const num = i + 1;
+      const statusBadge = s.isActive
+        ? "🟢 <b>[Active]</b>"
+        : s.isArchived
+        ? "📦 <i>[Archived]</i>"
+        : "⚪ <i>[Idle]</i>";
+
+      const dateStr = new Date(s.mtime).toLocaleDateString("id-ID", {
+        day: "numeric",
+        month: "short",
+        hour: "2-digit",
+        minute: "2-digit",
+        timeZone: "Asia/Makassar",
+      });
+
+      msg += `${num}. ${statusBadge} <code>${escapeHtml(s.shortId)}</code> (${dateStr})\n`;
+      msg += `   ↳ <i>${escapeHtml(s.summary)}</i>\n`;
+      msg += `   ↳ <code>${s.messageCount} msgs</code> • <code>${(s.size / 1024).toFixed(1)} KB</code>\n\n`;
+
+      if (!s.isActive) {
+        keyboard.text(`▶️ Resume #${num} (${s.shortId})`, `resume:${s.id}`).row();
+      }
+    }
+
+    if (sessions.length > maxDisplay) {
+      msg += `<i>...and ${sessions.length - maxDisplay} older sessions in storage</i>\n\n`;
+    }
+
+    msg += "<b>Usage:</b>\n";
+    msg += "• Tap a button below to switch, OR\n";
+    msg += "• Type <code>/resume &lt;number|id&gt;</code> (e.g. <code>/resume 2</code>)";
+
+    await ctx.reply(msg, {
+      parse_mode: "HTML",
+      reply_markup: keyboard.inline_keyboard.length > 0 ? keyboard : undefined,
+    });
+  } catch (err: any) {
+    await ctx.reply(`⚠️ Failed to list sessions: ${escapeHtml(err.message)}`, { parse_mode: "HTML" });
+  }
+};
+
+bot.command(["resume", "sessions", "session"], handleResume);
+
+// Callback Query Handler for Inline Resume Buttons: resume:<sessionId>
+bot.callbackQuery(/^resume:(.+)$/, async (ctx) => {
+  const chatId = ctx.chat?.id;
+  const targetId = ctx.match ? ctx.match[1] : undefined;
+  if (!chatId || !targetId) return;
+
+  await ctx.answerCallbackQuery({ text: "Switching session..." });
+
+  try {
+    const res = await sessionPool.resumeSession(chatId, targetId);
+    if (res.alreadyActive) {
+      await ctx.reply(`ℹ️ Session <code>${escapeHtml(res.session.sessionId)}</code> is already the active session.`, {
+        parse_mode: "HTML",
+      });
+      return;
+    }
+
+    const reply = [
+      `🔄 <b>Session Resumed!</b>`,
+      `• <b>Session ID:</b> <code>${escapeHtml(res.session.sessionId)}</code>`,
+      `• <b>Restored:</b> <code>${res.messageCount}</code> messages`,
+      `• <b>Topic:</b> <i>${escapeHtml(res.summary)}</i>`,
+      "",
+      "You can now continue this conversation seamlessly!",
+    ].join("\n");
+    await ctx.reply(reply, { parse_mode: "HTML" });
+  } catch (err: any) {
+    await ctx.reply(`⚠️ Failed to resume session: ${escapeHtml(err.message)}`, { parse_mode: "HTML" });
+  }
+});
 
 // Command: /restart (Remote Gateway Reboot)
 bot.command("restart", async (ctx) => {

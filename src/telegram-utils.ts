@@ -95,6 +95,91 @@ export function formatMarkdownTable(tableText: string): string {
 }
 
 /**
+ * Convert LaTeX mathematical expressions into readable Unicode text for Telegram.
+ */
+export function latexToUnicode(latex: string): string {
+  let s = latex.trim();
+
+  // 1. Text and styling blocks: \text{...}, \mathrm{...}, \mathbf{...}, \mathit{...}
+  s = s.replace(/\\(?:text|mathrm|mathbf|mathit)\{([^{}]*)\}/g, "$1");
+
+  // 2. Fractions: \frac{a}{b} -> (a / b)
+  s = s.replace(/\\frac\{([^{}]*)\}\{([^{}]*)\}/g, "($1 / $2)");
+
+  // 3. Mathematical operators and relational symbols
+  const symbolMap: Record<string, string> = {
+    "\\\\gg": "≫",
+    "\\\\ll": "≪",
+    "\\\\geq|\\\\ge": "≥",
+    "\\\\leq|\\\\le": "≤",
+    "\\\\neq|\\\\ne": "≠",
+    "\\\\approx": "≈",
+    "\\\\equiv": "≡",
+    "\\\\times": "×",
+    "\\\\div": "÷",
+    "\\\\pm": "±",
+    "\\\\mp": "∓",
+    "\\\\cdot": "·",
+    "\\\\to|\\\\rightarrow": "→",
+    "\\\\leftarrow": "←",
+    "\\\\Rightarrow": "⇒",
+    "\\\\Leftarrow": "⇐",
+    "\\\\infty": "∞",
+    "\\\\Delta": "Δ",
+    "\\\\delta": "δ",
+    "\\\\alpha": "α",
+    "\\\\beta": "β",
+    "\\\\gamma": "γ",
+    "\\\\pi": "π",
+    "\\\\mu": "µ",
+    "\\\\sigma": "σ",
+    "\\\\omega": "ω",
+    "\\\\degree|\\^\\\\circ": "°",
+    "\\\\sim": "~",
+    "\\\\quad|\\\\qquad|\\\\;|\\\\,|\\\\:": " ",
+  };
+
+  for (const [pattern, repl] of Object.entries(symbolMap)) {
+    s = s.replace(new RegExp(pattern, "g"), repl);
+  }
+
+  // 4. Subscripts map
+  const subMap: Record<string, string> = {
+    "0": "₀", "1": "₁", "2": "₂", "3": "₃", "4": "₄",
+    "5": "₅", "6": "₆", "7": "₇", "8": "₈", "9": "₉",
+    "+": "₊", "-": "₋", "=": "₌", "(": "₍", ")": "₎",
+    "a": "ₐ", "e": "ₑ", "h": "ₕ", "i": "ᵢ", "j": "ⱼ",
+    "k": "ₖ", "l": "ₗ", "m": "ₘ", "n": "ₙ", "o": "ₒ",
+    "p": "ₚ", "r": "ᵣ", "s": "ₛ", "t": "ₜ", "u": "ᵤ",
+    "v": "ᵥ", "x": "ₓ", ".": ".",
+  };
+
+  s = s.replace(/_\{([^}]+)\}/g, (_, chars) => {
+    return chars.split("").map((c: string) => subMap[c] || c).join("");
+  });
+  s = s.replace(/_([0-9a-z])/gi, (_, c) => subMap[c.toLowerCase()] || c);
+
+  // 5. Superscripts map
+  const supMap: Record<string, string> = {
+    "0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴",
+    "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹",
+    "+": "⁺", "-": "⁻", "=": "⁼", "(": "⁽", ")": "⁾",
+    "n": "ⁿ", "i": "ⁱ",
+  };
+
+  s = s.replace(/\^\{([^}]+)\}/g, (_, chars) => {
+    return chars.split("").map((c: string) => supMap[c] || c).join("");
+  });
+  s = s.replace(/\^([0-9ni+-])/g, (_, c) => supMap[c] || c);
+
+  // Clean leftover backslashes and redundant braces
+  s = s.replace(/\\([a-zA-Z]+)/g, "$1");
+  s = s.replace(/\{([^{}]*)\}/g, "$1");
+
+  return s.trim().replace(/\s+/g, " ");
+}
+
+/**
  * Converts standard Markdown (from Pi / LLM / CLI) to valid Telegram HTML.
  * Preserves code blocks, syntax highlighting tags, inline code, bold, italic,
  * links, blockquotes, headings, lists, and tables.
@@ -126,6 +211,32 @@ export function markdownToTelegramHtml(markdown: string): string {
     const idx = inlineCodes.length;
     inlineCodes.push(`<code>${escapeHtml(code)}</code>`);
     return `%%INLINE_CODE_${idx}%%`;
+  });
+
+  // 2.1 Convert LaTeX Math ($$...$$ block math and $...$ inline math)
+  const mathBlocks: string[] = [];
+  const inlineMaths: string[] = [];
+
+  // Block math: $$ ... $$
+  text = text.replace(/\$\$([\s\S]*?)\$\$/g, (_, latex) => {
+    const converted = latexToUnicode(latex);
+    const escaped = escapeHtml(converted);
+    const html = `\n<blockquote><b>${escaped}</b></blockquote>\n`;
+    const idx = mathBlocks.length;
+    mathBlocks.push(html);
+    return `%%MATH_BLOCK_${idx}%%`;
+  });
+
+  // Inline math: $ ... $ (ignoring currency like $100)
+  text = text.replace(/(^|[^\\])\$([^\$\n]+)\$(?!\$)/g, (match, prefix, latex) => {
+    if (/^\d+(?:\.\d+)?$/.test(latex.trim())) {
+      return match;
+    }
+    const converted = latexToUnicode(latex);
+    const escaped = escapeHtml(converted);
+    const idx = inlineMaths.length;
+    inlineMaths.push(`<b>${escaped}</b>`);
+    return `${prefix}%%MATH_INLINE_${idx}%%`;
   });
 
   // 3. Transform Markdown Tables into clean, mobile-friendly cards/lists
@@ -176,7 +287,9 @@ export function markdownToTelegramHtml(markdown: string): string {
   // 10. Bullet lists: lines starting with * or - or + followed by space
   text = text.replace(/^[\t ]*[-*+]\s+/gm, "• ");
 
-  // 11. Restore code blocks & inline code
+  // 11. Restore math blocks, code blocks & inline code
+  text = text.replace(/%%MATH_BLOCK_(\d+)%%/g, (_, idx) => mathBlocks[Number(idx)] || "");
+  text = text.replace(/%%MATH_INLINE_(\d+)%%/g, (_, idx) => inlineMaths[Number(idx)] || "");
   text = text.replace(/%%INLINE_CODE_(\d+)%%/g, (_, idx) => inlineCodes[Number(idx)] || "");
   text = text.replace(/%%CODE_BLOCK_(\d+)%%/g, (_, idx) => codeBlocks[Number(idx)] || "");
 
