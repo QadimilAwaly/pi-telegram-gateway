@@ -47,7 +47,12 @@ fi
 
 rm -f "$LOCK_FILE" "$HEALTH_FILE" 2>/dev/null
 
-# 3. If running inside tmux session "pi-tg", let tmux know or start background daemon
+# 3. Ensure Termux wake lock is held
+if command -v termux-wake-lock >/dev/null 2>&1; then
+  termux-wake-lock
+fi
+
+# 4. If running inside tmux session "pi-tg", let tmux know or start background daemon
 if tmux has-session -t pi-tg 2>/dev/null; then
   echo "📱 Found tmux session 'pi-tg'. Launching inside tmux..."
   tmux send-keys -t pi-tg C-c

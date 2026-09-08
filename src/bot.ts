@@ -28,10 +28,17 @@ if (!config.botToken) {
   process.exit(1);
 }
 
-const bot = new Bot(config.botToken);
+const bot = new Bot(config.botToken, {
+  client: {
+    timeoutSeconds: 35,
+  },
+});
 
 // Middleware: Access Control Whitelist
 bot.use(async (ctx, next) => {
+  const updateType = Object.keys(ctx.update).filter((k) => k !== "update_id").join(",");
+  console.log(`📩 [Raw Update]: #${ctx.update.update_id} (${updateType}) from ${ctx.from?.id} (@${ctx.from?.username || "no_user"})`);
+
   const userId = ctx.from?.id;
   if (!userId) return;
 
@@ -59,6 +66,7 @@ bot.command("start", async (ctx) => {
     "• <code>/resume</code> — Switch or restore a previous session",
     "• <code>/status</code> — View current model and session info",
     "• <code>/model [name]</code> — View or switch model",
+    "• <code>/thinking [level]</code> — View or switch reasoning level (off, low, medium, high, max)",
     "• <code>/steer &lt;text&gt;</code> — Steer/redirect active agent execution",
     "• <code>/cron</code> — Manage scheduled cron tasks",
     "• <code>/logs</code> — View recent gateway logs and errors live",
@@ -85,7 +93,9 @@ bot.command("help", async (ctx) => {
     "• <code>/resume</code> or <code>/sessions</code> — Browse and switch back to previous sessions.",
     "• <code>/status</code> — Check current session ID, model, and message count.",
     "• <code>/model</code> — Show active model and available alternatives.",
-    "• <code>/model &lt;provider/name&gt;</code> — Switch active model for this chat.",
+    "• <code>/model &lt;provider/name&gt;</code> — Switch active model for this chat (supports :thinking suffix).",
+    "• <code>/thinking</code> — Show current thinking level and available options.",
+    "• <code>/thinking &lt;level&gt;</code> — Set reasoning effort (off, low, medium, high, max) or /thinking next.",
     "• <code>/cron</code> — Manage scheduled background jobs and recurring tasks.",
     "• <code>/logs</code> — View live gateway execution logs, tool calls, and errors.",
     "• <code>/archive</code> — View storage stats, compress old sessions (.gz), and export transcripts.",
@@ -332,6 +342,7 @@ bot.command("status", async (ctx) => {
       "📊 <b>Pi Session Status</b>",
       `• <b>Session ID:</b> <code>${escapeHtml(session.sessionId)}</code>`,
       `• <b>Model:</b> <code>${escapeHtml(model ? `${model.provider}/${model.id}` : "default")}</code>`,
+      `• <b>Thinking Level:</b> <code>${escapeHtml(session.thinkingLevel || "off")}</code>`,
       `• <b>Context Window:</b> <code>${formatNumber(usedContextTokens)} / ${formatNumber(maxContextTokens)} tokens (${contextPercent}%)</code>`,
     ];
 
@@ -1078,7 +1089,8 @@ bot.command("model", async (ctx) => {
     try {
       const switched = await sessionPool.setModel(chatId, targetModel);
       if (switched) {
-        await ctx.reply(`✅ Switched model to: <code>${escapeHtml(`${switched.provider}/${switched.id}`)}</code>`, {
+        const thinkingNote = switched.thinkingLevel ? `\n🧠 <b>Thinking Level:</b> <code>${escapeHtml(switched.thinkingLevel)}</code>` : "";
+        await ctx.reply(`✅ Switched model to: <code>${escapeHtml(`${switched.model.provider}/${switched.model.id}`)}</code>${thinkingNote}`, {
           parse_mode: "HTML",
         });
       } else {
@@ -1097,11 +1109,13 @@ bot.command("model", async (ctx) => {
   try {
     const entry = await sessionPool.getSession(chatId);
     const currentModel = entry.session.model;
+    const currentThinking = entry.session.thinkingLevel || "off";
     const services = sessionPool.getServices();
     const modelRuntime = services?.modelRuntime;
     const available = modelRuntime ? await modelRuntime.getAvailable() : [];
 
-    let msg = `🤖 <b>Current Model:</b> <code>${escapeHtml(currentModel ? `${currentModel.provider}/${currentModel.id}` : "default")}</code>\n\n`;
+    let msg = `🤖 <b>Current Model:</b> <code>${escapeHtml(currentModel ? `${currentModel.provider}/${currentModel.id}` : "default")}</code>\n`;
+    msg += `🧠 <b>Thinking Level:</b> <code>${escapeHtml(currentThinking)}</code>\n\n`;
 
     if (available.length > 0) {
       msg += `<b>Available Models (${available.length} total):</b>\n`;
@@ -1111,7 +1125,7 @@ bot.command("model", async (ctx) => {
       if (available.length > 10) {
         msg += `<i>...and ${available.length - 10} more</i>\n`;
       }
-      msg += `\nSwitch with: <code>/model &lt;provider/model-id&gt;</code>`;
+      msg += `\nSwitch with: <code>/model &lt;provider/model-id&gt;</code>\nOr with thinking: <code>/model &lt;provider/model-id&gt;:&lt;level&gt;</code>\nChange thinking only: <code>/thinking &lt;level&gt;</code>`;
     } else {
       msg += `<i>No configured models found.</i>`;
     }
@@ -1119,6 +1133,63 @@ bot.command("model", async (ctx) => {
     await ctx.reply(msg, { parse_mode: "HTML" });
   } catch (err: any) {
     await ctx.reply(`⚠️ Error fetching models: ${escapeHtml(err.message)}`, { parse_mode: "HTML" });
+  }
+});
+
+// Command: /thinking
+bot.command("thinking", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return;
+
+  const text = ctx.message?.text || "";
+  const parts = text.split(" ").slice(1);
+  const targetLevel = parts.join(" ").trim().toLowerCase();
+
+  if (targetLevel === "next" || targetLevel === "cycle") {
+    try {
+      const result = await sessionPool.cycleThinkingLevel(chatId);
+      await ctx.reply(
+        `🧠 Thinking level cycled to: <code>${escapeHtml(result.level)}</code> (previous: <code>${escapeHtml(result.previous)}</code>)`,
+        { parse_mode: "HTML" }
+      );
+    } catch (err: any) {
+      await ctx.reply(`⚠️ Error cycling thinking level: ${escapeHtml(err.message)}`, { parse_mode: "HTML" });
+    }
+    return;
+  }
+
+  if (targetLevel) {
+    try {
+      const result = await sessionPool.setThinkingLevel(chatId, targetLevel);
+      await ctx.reply(
+        `🧠 Thinking level set to: <code>${escapeHtml(result.level)}</code> (previous: <code>${escapeHtml(result.previous)}</code>)`,
+        { parse_mode: "HTML" }
+      );
+    } catch (err: any) {
+      await ctx.reply(`⚠️ Error setting thinking level: ${escapeHtml(err.message)}`, { parse_mode: "HTML" });
+    }
+    return;
+  }
+
+  // Show current thinking info & available levels
+  try {
+    const info = await sessionPool.getThinkingInfo(chatId);
+    let msg = `🧠 <b>Current Thinking Level:</b> <code>${escapeHtml(info.current)}</code>\n`;
+    msg += `• <b>Model Supports Reasoning:</b> ${info.supportsThinking ? "✅ Yes" : "❌ No"}\n\n`;
+
+    msg += `<b>Available Levels:</b>\n`;
+    for (const lvl of info.available) {
+      const indicator = lvl.toLowerCase() === info.current.toLowerCase() ? "👉 " : "• ";
+      msg += `${indicator}<code>${escapeHtml(lvl)}</code>\n`;
+    }
+
+    msg += `\n<b>Usage:</b>\n`;
+    msg += `• <code>/thinking &lt;level&gt;</code> (e.g. <code>/thinking high</code> or <code>/thinking off</code>)\n`;
+    msg += `• <code>/thinking next</code> to cycle through levels`;
+
+    await ctx.reply(msg, { parse_mode: "HTML" });
+  } catch (err: any) {
+    await ctx.reply(`⚠️ Error fetching thinking info: ${escapeHtml(err.message)}`, { parse_mode: "HTML" });
   }
 });
 
@@ -1488,7 +1559,7 @@ async function main() {
   let retryDelay = 2000;
   while (true) {
     try {
-      await bot.api.deleteWebhook({ drop_pending_updates: true });
+      await bot.api.deleteWebhook({ drop_pending_updates: false });
       await bot.init();
       const botInfo = bot.botInfo;
       healthMonitor.init(botInfo);
@@ -1501,11 +1572,15 @@ async function main() {
         console.log("⚠️ No ALLOWED_USERS configured (open to any Telegram user)");
       }
 
+      // Hardened long-polling runner:
+      // - 20s fetch timeout with 35s client timeout (prevents long-polling cutoffs and silent TCP NAT drops)
+      // - Fixed 2000ms retryInterval (prevents unbounded exponential backoff lockup during Android sleep/network drops)
       runner = run(bot, {
         runner: {
           fetch: {
-            timeout: 30,
+            timeout: 20,
           },
+          retryInterval: 2000,
         },
       });
 

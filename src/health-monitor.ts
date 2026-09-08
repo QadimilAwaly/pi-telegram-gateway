@@ -39,11 +39,14 @@ export class HealthMonitor {
     this.botInfo = botInfo;
     this.startTime = Date.now();
 
-    // 1. Initial snapshot & 5s interval update
+    // 1. Initial snapshot & 60s relaxed interval update (minimizes disk I/O and CPU wakeups)
     this.updateSnapshot();
     this.heartbeatTimer = setInterval(() => {
       this.updateSnapshot();
-    }, 5000);
+    }, 60_000);
+    if (this.heartbeatTimer?.unref) {
+      this.heartbeatTimer.unref();
+    }
 
     // 2. Local loopback HTTP health server on 127.0.0.1:4080
     try {
@@ -55,6 +58,10 @@ export class HealthMonitor {
             const url = new URL(req.url);
             if (url.pathname === "/health" || url.pathname === "/status") {
               const state = this.getHealthState();
+              // Refresh disk snapshot on-demand so manual checks always see real-time data
+              try {
+                fs.writeFileSync(this.healthFile, JSON.stringify(state, null, 2), "utf-8");
+              } catch {}
               return new Response(JSON.stringify(state, null, 2), {
                 headers: { "Content-Type": "application/json" },
               });

@@ -373,12 +373,25 @@ export class SessionPool {
     };
   }
 
-  async setModel(chatId: number, providerOrModelStr: string): Promise<Model | null> {
+  async setModel(chatId: number, providerOrModelStr: string): Promise<{ model: Model; thinkingLevel?: string } | null> {
     const entry = await this.getSession(chatId);
     if (!this.services?.modelRuntime) return null;
 
+    let rawModelStr = providerOrModelStr.trim();
+    let requestedThinking: string | undefined;
+
+    if (rawModelStr.includes(":")) {
+      const colonIdx = rawModelStr.lastIndexOf(":");
+      const possibleLevel = rawModelStr.slice(colonIdx + 1).trim().toLowerCase();
+      const validLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+      if (validLevels.includes(possibleLevel)) {
+        requestedThinking = possibleLevel;
+        rawModelStr = rawModelStr.slice(0, colonIdx).trim();
+      }
+    }
+
     const runtime = this.services.modelRuntime;
-    const parts = providerOrModelStr.split("/");
+    const parts = rawModelStr.split("/");
     let model: Model | undefined;
 
     if (parts.length === 2) {
@@ -387,16 +400,56 @@ export class SessionPool {
       const available = await runtime.getAvailable();
       model = available.find(
         (m: Model) =>
-          m.id.toLowerCase() === providerOrModelStr.toLowerCase() ||
-          `${m.provider}/${m.id}`.toLowerCase() === providerOrModelStr.toLowerCase()
+          m.id.toLowerCase() === rawModelStr.toLowerCase() ||
+          `${m.provider}/${m.id}`.toLowerCase() === rawModelStr.toLowerCase()
       );
     }
 
     if (model) {
       await entry.session.setModel(model);
-      return model;
+      if (requestedThinking) {
+        entry.session.setThinkingLevel(requestedThinking as any);
+      }
+      return {
+        model,
+        thinkingLevel: entry.session.thinkingLevel,
+      };
     }
     return null;
+  }
+
+  async setThinkingLevel(chatId: number, level: string): Promise<{ level: string; previous: string }> {
+    const entry = await this.getSession(chatId);
+    const previous = entry.session.thinkingLevel || "off";
+    entry.session.setThinkingLevel(level as any);
+    const effective = entry.session.thinkingLevel || level;
+    return { level: effective, previous };
+  }
+
+  async cycleThinkingLevel(chatId: number): Promise<{ level: string; previous: string }> {
+    const entry = await this.getSession(chatId);
+    const previous = entry.session.thinkingLevel || "off";
+    const next = entry.session.cycleThinkingLevel ? entry.session.cycleThinkingLevel() : undefined;
+    const effective = next || entry.session.thinkingLevel || previous;
+    return { level: effective, previous };
+  }
+
+  async getThinkingInfo(chatId: number): Promise<{
+    current: string;
+    available: string[];
+    supportsThinking: boolean;
+  }> {
+    const entry = await this.getSession(chatId);
+    const current = entry.session.thinkingLevel || "off";
+    const available = entry.session.getAvailableThinkingLevels
+      ? entry.session.getAvailableThinkingLevels()
+      : ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+    const supportsThinking = entry.session.supportsThinking ? entry.session.supportsThinking() : false;
+    return {
+      current,
+      available,
+      supportsThinking,
+    };
   }
 
   async compactSession(chatId: number): Promise<string> {

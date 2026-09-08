@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import os from "os";
+import { config } from "./config";
 
 const defaultHome = os.homedir();
 const sessionsDir =
@@ -72,7 +73,7 @@ async function main() {
   }
 
   const timeSinceHeartbeat = Math.floor((Date.now() - state.lastHeartbeat) / 1000);
-  const isHeartbeatHealthy = timeSinceHeartbeat < 15;
+  const isHeartbeatHealthy = timeSinceHeartbeat < 90;
 
   console.log(
     `🟢 STATUS:             \x1b[32mONLINE (Active)\x1b[0m ${
@@ -99,9 +100,33 @@ async function main() {
   const logFile = path.join(sessionsDir, "gateway.log");
   const logSizeKb = fs.existsSync(logFile) ? Math.round(fs.statSync(logFile).size / 1024) : 0;
   console.log(`📑 Live Logs:          ${logFile} (${logSizeKb} KB)`);
-  console.log(
-    `⏰ Scheduled Cron:     \x1b[36m${state.activeCronJobs} active job(s)\x1b[0m`
-  );
+  // Check upstream Telegram Cloud sync health
+  let syncStatus = "\x1b[90mChecking...\x1b[0m";
+  try {
+    const tgRes = await fetch(
+      `https://api.telegram.org/bot${config.botToken}/getWebhookInfo`,
+      { signal: AbortSignal.timeout(2000) }
+    );
+    if (tgRes.ok) {
+      const tgData = (await tgRes.json())?.result;
+      const syncErr = tgData?.last_synchronization_error_date;
+      if (!syncErr) {
+        syncStatus = "\x1b[32mHealthy (Synchronized)\x1b[0m";
+      } else {
+        const diff = Math.max(0, Math.floor(Date.now() / 1000 - syncErr));
+        if (diff > 120) {
+          syncStatus = `\x1b[32mRecovered (last glitch ${diff}s ago)\x1b[0m`;
+        } else {
+          syncStatus = `\x1b[31mDegraded Upstream DC (Telegram DC error ${diff}s ago)\x1b[0m`;
+        }
+      }
+    }
+  } catch {
+    syncStatus = "\x1b[33mUnreachable / Timeout\x1b[0m";
+  }
+
+  console.log(`🌐 Cloud Sync Status: ${syncStatus}`);
+  console.log(`⏰ Scheduled Cron:     \x1b[36m${state.activeCronJobs} active job(s)\x1b[0m`);
   console.log(`🩺 Health API:         http://127.0.0.1:4080/health`);
   console.log(`📁 Storage Path:       ${sessionsDir}`);
   console.log("\n=======================================================\n");
