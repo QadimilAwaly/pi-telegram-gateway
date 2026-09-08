@@ -673,29 +673,21 @@ discordClient.on("messageCreate", async (message: Message) => {
     const duration = ((Date.now() - turnStartTime) / 1000).toFixed(2);
     console.log(`✅ [Discord Turn Complete] Finished in ${duration}s.`);
 
+    // Delete temporary progressive status message cleanly so final reply is a FRESH message
+    if (statusMsg) {
+      await (statusMsg as any).delete().catch(() => {});
+      statusMsg = null;
+    }
+
     if (!fullResponse.trim()) {
-      if (statusMsg) {
-        await (statusMsg as any).edit("✅ *Done.*").catch(() => {});
-      }
+      await message.reply("✅ *Done.*").catch(() => {});
       return;
     }
 
+    // Send final response as fresh reply -> TRIGGERS DISCORD PUSH NOTIFICATION & SOUND!
     const chunks = splitDiscordMessage(fullResponse);
-    if (statusMsg && chunks.length > 0 && chunks[0]) {
-      // Transform statusMsg into chunk 0 in-place
-      await (statusMsg as any).edit(chunks[0]).catch(async () => {
-        await message.reply(chunks[0]!);
-      });
-      // Send remaining chunks
-      for (let i = 1; i < chunks.length; i++) {
-        if (chunks[i]) {
-          await message.reply(chunks[i]!).catch(() => {});
-        }
-      }
-    } else {
-      for (const chunk of chunks) {
-        await message.reply(chunk).catch(() => {});
-      }
+    for (const chunk of chunks) {
+      await message.reply(chunk).catch(() => {});
     }
   } catch (err: any) {
     clearInterval(typingInterval);
