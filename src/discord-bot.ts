@@ -1,3 +1,5 @@
+import fs from "fs";
+import path from "path";
 import {
   Client,
   GatewayIntentBits,
@@ -28,13 +30,23 @@ export const discordClient = new Client({
   partials: [Partials.Channel, Partials.Message],
 });
 
-// Track default channel for cron broadcasts
+// Track default channel for cron broadcasts with persistence
+const homeChannelFile = path.join(config.sessionsDir, "discord-home-channel.txt");
 let defaultBroadcastChannelId: string | null = null;
+try {
+  if (fs.existsSync(homeChannelFile)) {
+    const saved = fs.readFileSync(homeChannelFile, "utf-8").trim();
+    if (saved) defaultBroadcastChannelId = saved;
+  }
+} catch {}
 
 discordClient.once("ready", (client) => {
   console.log(`🤖 Discord Gateway active as ${client.user.tag} (ID: ${client.user.id})`);
   console.log(`📁 Working Directory: ${config.defaultCwd}`);
   console.log(`💾 Sessions Directory: ${config.sessionsDir}`);
+  if (defaultBroadcastChannelId) {
+    console.log(`🏠 Discord Cron Home Channel: ${defaultBroadcastChannelId}`);
+  }
   if (config.discordAllowedUsers.length > 0) {
     console.log(`🔐 Allowed Discord User IDs: ${config.discordAllowedUsers.join(", ")}`);
   } else {
@@ -91,6 +103,8 @@ async function executeDiscordCommand(
       "• `/thinking [level]` — View or switch reasoning level (`off`, `low`, `medium`, `high`, `max`)",
       "• `/steer <instruction>` — Redirect or modify active agent execution mid-flight",
       "• `/cron` — View or manage scheduled background tasks (inherited from Telegram)",
+      "• `/cron run <id>` — Trigger and execute a scheduled cron task immediately",
+      "• `/set-home` — Set current channel as the permanent destination for cron reports",
       "• `/new` or `/reset` — Clear active context and start a fresh session",
       "• `/compact` — Compact and summarize current conversation history",
       "• `/abort` or `/stop` — Instantly terminate currently running agent turn",
@@ -204,29 +218,113 @@ async function executeDiscordCommand(
     return true;
   }
 
-  // /cron
+  // /cron [run|pause|resume|logs]
   if (commandName === "cron") {
+    const sub = args[0]?.toLowerCase();
+    const targetId = args[1]?.trim();
+
+    // 1. Manual run trigger: /cron run <id>
+    if (sub === "run") {
+      if (!targetId) {
+        await reply("⚠️ Mohon cantumkan ID cron job: `/cron run <id>`\nContoh: `/cron run pengingat_jadwal_harian`");
+        return true;
+      }
+      const job = cronScheduler.getJob(targetId);
+      if (!job) {
+        await reply(`⚠️ Job dengan ID \`${targetId}\` tidak ditemukan. Ketik \`/cron\` untuk melihat daftar ID yang valid.`);
+        return true;
+      }
+      await reply(`⏳ Menjalankan scheduled job **${job.name || job.id}** (\`${job.id}\`) sekarang...`);
+      try {
+        await cronScheduler.executeJob(job.id, true);
+        await reply(`✅ Eksekusi manual **${job.name || job.id}** selesai! Laporan telah dikirimkan.`);
+      } catch (err: any) {
+        await reply(`❌ Eksekusi manual gagal: ${err.message}`);
+      }
+      return true;
+    }
+
+    // 2. Pause / Resume
+    if (sub === "pause" || sub === "resume" || sub === "toggle") {
+      if (!targetId) {
+        await reply(`⚠️ Mohon cantumkan ID: \`/cron ${sub} <id>\``);
+        return true;
+      }
+      if (sub === "pause") {
+        const ok = cronScheduler.pauseJob(targetId);
+        await reply(ok ? `⏸️ Job \`${targetId}\` dinonaktifkan.` : `⚠️ Job tidak ditemukan.`);
+        return true;
+      }
+      if (sub === "resume") {
+        const ok = cronScheduler.resumeJob(targetId);
+        await reply(ok ? `▶️ Job \`${targetId}\` diaktifkan kembali.` : `⚠️ Job tidak ditemukan.`);
+        return true;
+      }
+    }
+
+    // 3. View Logs
+    if (sub === "logs" || sub === "history") {
+      const jobLogs = cronScheduler.getLogs(targetId || undefined, 5);
+      if (jobLogs.length === 0 || jobLogs.every((j) => j.logs.length === 0)) {
+        await reply("ℹ️ Belum ada catatan riwayat eksekusi cron.");
+        return true;
+      }
+      let logMsg = "📋 **Cron Execution History:**\n\n";
+      for (const { job, logs } of jobLogs) {
+        if (logs.length === 0) continue;
+        const mode = job.noAgent ? "⚡ Script" : "🧠 Agent";
+        logMsg += `• **${job.name || job.id}** [${mode}] (\`${job.id}\`):\n`;
+        for (const e of logs.slice(-5).reverse()) {
+          const time = new Date(e.runAt).toLocaleString("id-ID");
+          const icon = e.status === "success" ? "✅" : "❌";
+          const dur = ((e.durationMs || 0) / 1000).toFixed(2) + "s";
+          const preview = (e.outputSnippet || e.error || "Done").replace(/\n+/g, " ").slice(0, 60);
+          logMsg += `  ${icon} ${time} (${dur}) -> ${preview}\n`;
+        }
+        logMsg += "\n";
+      }
+      await reply(logMsg);
+      return true;
+    }
+
+    // 4. Default: List jobs with clear visible IDs
     try {
       const jobs = cronScheduler.listJobs();
       if (jobs.length === 0) {
-        await reply("ℹ️ No scheduled cron jobs configured.");
+        await reply("ℹ️ Tidak ada scheduled cron jobs yang terdaftar.");
         return true;
       }
       let report = `⏰ **Scheduled Cron Jobs (${jobs.length} total):**\n\n`;
       for (const job of jobs) {
         const mode = job.noAgent ? "⚡ Script" : "🧠 Agent";
-        const status = job.enabled ? "✅ Active" : "⏸️ Disabled";
+        const status = job.enabled ? "✅ Active" : "⏸️ Paused";
         report += `• **${job.name || job.id}** [${mode}] — ${status}\n`;
-        report += `  Schedule: \`${job.cronExpression}\` | Timezone: \`${job.timezone || "Default"}\`\n`;
+        report += `  • **ID:** \`${job.id}\`\n`;
+        report += `  • **Schedule:** \`${job.cronExpression}\` | Timezone: \`${job.timezone || "Default"}\`\n`;
         if (job.lastRun) {
           const timeStr = new Date(job.lastRun).toLocaleString("id-ID");
-          report += `  Last Run: ${timeStr} (${job.lastStatus === "success" ? "✅" : "❌"} ${(job.lastDurationMs || 0) / 1000}s)\n`;
+          report += `  • **Last Run:** ${job.lastStatus === "success" ? "✅" : "❌"} ${timeStr} (${((job.lastDurationMs || 0) / 1000).toFixed(2)}s)\n`;
         }
         report += "\n";
       }
+      report += `💡 **Commands:**\n• \`/cron run <id>\` — Jalankan job secara manual sekarang\n• \`/cron logs [id]\` — Lihat log eksekusi\n• \`/cron pause <id>\` / \`/cron resume <id>\` — Jeda/lanjutkan jadwal\n• \`/set-home\` — Kunci kanal ini sebagai target siaran cron`;
       await reply(report);
     } catch (err: any) {
-      await reply(`⚠️ Error fetching cron jobs: ${err.message}`);
+      await reply(`⚠️ Gagal mengambil cron jobs: ${err.message}`);
+    }
+    return true;
+  }
+
+  // /set-home or /sethome
+  if (commandName === "set-home" || commandName === "sethome") {
+    defaultBroadcastChannelId = channelId;
+    try {
+      fs.writeFileSync(homeChannelFile, channelId, "utf-8");
+      await reply(
+        `🏠 **Home Channel Berhasil Disetel!**\nKanal ini (<#${channelId}>) sekarang dikunci sebagai target siaran laporan otomatis (**Cron Broadcast Target**).\nSeluruh jadwal pengingat mengajar dan briefing berita akan otomatis mendarat di sini secara persisten.`
+      );
+    } catch (err: any) {
+      await reply(`⚠️ Gagal menyimpan home channel ke disk: ${err.message}`);
     }
     return true;
   }
