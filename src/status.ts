@@ -82,7 +82,11 @@ async function main() {
   );
   console.log(`🆔 PID:                ${state.pid}`);
   console.log(`⏱️  Uptime:             ${formatUptime(state.uptimeSeconds)}`);
-  console.log(`📱 Telegram Bot:    @${state.botUsername} (ID: ${state.botId})`);
+  if (config.mode === "discord") {
+    console.log(`📱 Telegram Bot:    \x1b[90mDisabled (GATEWAY_MODE=discord)\x1b[0m`);
+  } else {
+    console.log(`📱 Telegram Bot:    @${state.botUsername} (ID: ${state.botId})`);
+  }
   if (config.discordBotToken) {
     console.log(`🎮 Discord Bot:     Hermes_maid_bot (Connected ⚡)`);
   }
@@ -105,27 +109,31 @@ async function main() {
   console.log(`📑 Live Logs:          ${logFile} (${logSizeKb} KB)`);
   // Check upstream Telegram Cloud sync health
   let syncStatus = "\x1b[90mChecking...\x1b[0m";
-  try {
-    const tgRes = await fetch(
-      `https://api.telegram.org/bot${config.botToken}/getWebhookInfo`,
-      { signal: AbortSignal.timeout(2000) }
-    );
-    if (tgRes.ok) {
-      const tgData = ((await tgRes.json()) as any)?.result;
-      const syncErr = tgData?.last_synchronization_error_date;
-      if (!syncErr) {
-        syncStatus = "\x1b[32mHealthy (Synchronized)\x1b[0m";
-      } else {
-        const diff = Math.max(0, Math.floor(Date.now() / 1000 - syncErr));
-        if (diff > 120) {
-          syncStatus = `\x1b[32mRecovered (last glitch ${diff}s ago)\x1b[0m`;
+  if (config.mode === "discord") {
+    syncStatus = "\x1b[32mBypassed (Discord-Only Active)\x1b[0m";
+  } else {
+    try {
+      const tgRes = await fetch(
+        `https://api.telegram.org/bot${config.botToken}/getWebhookInfo`,
+        { signal: AbortSignal.timeout(2000) }
+      );
+      if (tgRes.ok) {
+        const tgData = ((await tgRes.json()) as any)?.result;
+        const syncErr = tgData?.last_synchronization_error_date;
+        if (!syncErr) {
+          syncStatus = "\x1b[32mHealthy (Synchronized)\x1b[0m";
         } else {
-          syncStatus = `\x1b[31mDegraded Upstream DC (Telegram DC error ${diff}s ago)\x1b[0m`;
+          const diff = Math.max(0, Math.floor(Date.now() / 1000 - syncErr));
+          if (diff > 120) {
+            syncStatus = `\x1b[32mRecovered (last glitch ${diff}s ago)\x1b[0m`;
+          } else {
+            syncStatus = `\x1b[31mDegraded Upstream DC (Telegram DC error ${diff}s ago)\x1b[0m`;
+          }
         }
       }
+    } catch {
+      syncStatus = "\x1b[33mUnreachable / Timeout\x1b[0m";
     }
-  } catch {
-    syncStatus = "\x1b[33mUnreachable / Timeout\x1b[0m";
   }
 
   console.log(`🌐 Cloud Sync Status: ${syncStatus}`);

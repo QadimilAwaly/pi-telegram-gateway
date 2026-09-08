@@ -62,8 +62,8 @@ export class CronScheduler {
       (sysTz && sysTz !== "UTC" ? sysTz : "Asia/Jakarta");
   }
 
-  init(bot: Bot) {
-    this.bot = bot;
+  init(bot?: Bot | null) {
+    this.bot = bot || null;
     this.loadJobs();
     this.scheduleAll();
     this.startWatcher();

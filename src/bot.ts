@@ -1551,11 +1551,14 @@ async function main() {
   console.log("Initializing Pi Session Services (extensions, skills, models)...");
   await sessionPool.init();
 
-  console.log("Initializing Cron Scheduler...");
-  cronScheduler.init(bot);
+  const runTelegram = config.mode === "dual" || config.mode === "telegram";
+  const runDiscord = (config.mode === "dual" || config.mode === "discord") && !!config.discordBotToken;
 
-  // Initialize Discord Gateway if token is provided
-  if (config.discordBotToken) {
+  console.log("Initializing Cron Scheduler...");
+  cronScheduler.init(runTelegram ? bot : null);
+
+  // Initialize Discord Gateway if enabled
+  if (runDiscord) {
     try {
       console.log("Starting Discord Gateway client...");
       await discordClient.login(config.discordBotToken);
@@ -1564,7 +1567,8 @@ async function main() {
     }
   }
 
-  console.log("Starting Pi Telegram Gateway with Concurrent Runner...");
+  if (runTelegram) {
+    console.log("Starting Pi Telegram Gateway with Concurrent Runner...");
 
   let runner: RunnerHandle | null = null;
   let retryDelay = 2000;
@@ -1624,6 +1628,12 @@ async function main() {
       await new Promise((resolve) => setTimeout(resolve, retryDelay));
       retryDelay = Math.min(retryDelay * 1.5, 30000);
     }
+  }
+  } else {
+    // Standalone Discord Mode
+    healthMonitor.init({ username: "Hermes_maid_bot", id: 1534861950390112277 });
+    console.log("🎮 Standalone Discord Gateway active! (Telegram mode disabled)");
+    await new Promise(() => {});
   }
 }
 

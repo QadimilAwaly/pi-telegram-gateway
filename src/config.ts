@@ -6,6 +6,7 @@ import os from "os";
 dotenv.config();
 
 export interface GatewayConfig {
+  mode: "dual" | "telegram" | "discord";
   botToken: string;
   discordBotToken: string;
   allowedUsers: number[];
@@ -28,6 +29,7 @@ function parseAllowedUsers(raw?: string): number[] {
 const defaultHome = os.homedir();
 
 export const config: GatewayConfig = {
+  mode: (process.env.GATEWAY_MODE as any) || "dual",
   botToken: process.env.TELEGRAM_BOT_TOKEN || "",
   discordBotToken: process.env.DISCORD_BOT_TOKEN || "",
   allowedUsers: parseAllowedUsers(process.env.ALLOWED_USERS),
