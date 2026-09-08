@@ -48,6 +48,12 @@ export class CronScheduler {
   private fileWatcher: fs.FSWatcher | null = null;
   private isSaving = false;
 
+  private discordSender: ((title: string, rawText: string) => Promise<void>) | null = null;
+
+  setDiscordSender(sender: ((title: string, rawText: string) => Promise<void>) | null) {
+    this.discordSender = sender;
+  }
+
   constructor() {
     this.storageFile = path.join(config.sessionsDir, "cron-jobs.json");
     const sysTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -510,6 +516,18 @@ export class CronScheduler {
           }
         }
 
+        if (this.discordSender) {
+          try {
+            const timeStr = new Date().toLocaleString("id-ID", {
+              timeZone: job.timezone || this.defaultTimezone,
+            });
+            const title = `⏰ **[Scheduled Task]** **${job.name || job.id}** (⚡ Direct Script)\n📅 *${timeStr}* | ⏱️ *${(durationMs / 1000).toFixed(2)}s*\n\n`;
+            await this.discordSender(title, output);
+          } catch (err: any) {
+            console.error("❌ [Cron Discord] Error sending direct script output:", err.message);
+          }
+        }
+
         return output;
       } catch (err: any) {
         console.error(`❌ [Cron No-Agent] Error running job ${job.id}:`, err.message);
@@ -639,6 +657,18 @@ export class CronScheduler {
           } catch {
             await this.bot.api.sendMessage(job.chatId, chunk.replace(/<[^>]*>/g, ""));
           }
+        }
+      }
+
+      if (this.discordSender) {
+        try {
+          const timeStr = new Date().toLocaleString("id-ID", {
+            timeZone: job.timezone || this.defaultTimezone,
+          });
+          const title = `⏰ **[Scheduled Task]** **${job.name || job.id}** (🧠 Agent)\n📅 *${timeStr}* | ⏱️ *${(durationMs / 1000).toFixed(2)}s*\n\n`;
+          await this.discordSender(title, fullResponse);
+        } catch (err: any) {
+          console.error("❌ [Cron Discord] Error sending agent output:", err.message);
         }
       }
 

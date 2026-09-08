@@ -29,14 +29,14 @@ export interface SessionInfo {
 
 interface ActiveSessionEntry {
   session: AgentSession;
-  chatId: number;
+  chatId: string | number;
   lastActive: number;
   isProcessing: boolean;
   aborted?: boolean;
 }
 
 export class SessionPool {
-  private sessions = new Map<number, ActiveSessionEntry>();
+  private sessions = new Map<string | number, ActiveSessionEntry>();
   private services: any = null;
   private cleanupInterval: any = null;
 
@@ -68,7 +68,7 @@ export class SessionPool {
     return this.services;
   }
 
-  private getChatSessionDir(chatId: number): string {
+  private getChatSessionDir(chatId: string | number): string {
     const dir = path.join(config.sessionsDir, `chat_${chatId}`);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
@@ -102,7 +102,7 @@ export class SessionPool {
     }
   }
 
-  async getSession(chatId: number): Promise<ActiveSessionEntry> {
+  async getSession(chatId: string | number): Promise<ActiveSessionEntry> {
     const existing = this.sessions.get(chatId);
     if (existing) {
       existing.lastActive = Date.now();
@@ -134,7 +134,7 @@ export class SessionPool {
     return entry;
   }
 
-  async resetSession(chatId: number): Promise<AgentSession> {
+  async resetSession(chatId: string | number): Promise<AgentSession> {
     const existing = this.sessions.get(chatId);
     if (existing) {
       try {
@@ -176,7 +176,7 @@ export class SessionPool {
     return session;
   }
 
-  async listSessions(chatId: number): Promise<SessionInfo[]> {
+  async listSessions(chatId: string | number): Promise<SessionInfo[]> {
     const chatDir = this.getChatSessionDir(chatId);
     const archiveDir = path.join(chatDir, ".archive");
     const activeEntry = this.sessions.get(chatId);
@@ -276,7 +276,7 @@ export class SessionPool {
   }
 
   async resumeSession(
-    chatId: number,
+    chatId: string | number,
     targetIdOrPrefix: string
   ): Promise<{ session: AgentSession; previousId?: string; summary: string; messageCount: number; alreadyActive?: boolean }> {
     const activeEntry = this.sessions.get(chatId);
@@ -373,7 +373,7 @@ export class SessionPool {
     };
   }
 
-  async setModel(chatId: number, providerOrModelStr: string): Promise<{ model: Model; thinkingLevel?: string } | null> {
+  async setModel(chatId: string | number, providerOrModelStr: string): Promise<{ model: Model; thinkingLevel?: string } | null> {
     const entry = await this.getSession(chatId);
     if (!this.services?.modelRuntime) return null;
 
@@ -418,7 +418,7 @@ export class SessionPool {
     return null;
   }
 
-  async setThinkingLevel(chatId: number, level: string): Promise<{ level: string; previous: string }> {
+  async setThinkingLevel(chatId: string | number, level: string): Promise<{ level: string; previous: string }> {
     const entry = await this.getSession(chatId);
     const previous = entry.session.thinkingLevel || "off";
     entry.session.setThinkingLevel(level as any);
@@ -426,7 +426,7 @@ export class SessionPool {
     return { level: effective, previous };
   }
 
-  async cycleThinkingLevel(chatId: number): Promise<{ level: string; previous: string }> {
+  async cycleThinkingLevel(chatId: string | number): Promise<{ level: string; previous: string }> {
     const entry = await this.getSession(chatId);
     const previous = entry.session.thinkingLevel || "off";
     const next = entry.session.cycleThinkingLevel ? entry.session.cycleThinkingLevel() : undefined;
@@ -434,7 +434,7 @@ export class SessionPool {
     return { level: effective, previous };
   }
 
-  async getThinkingInfo(chatId: number): Promise<{
+  async getThinkingInfo(chatId: string | number): Promise<{
     current: string;
     available: string[];
     supportsThinking: boolean;
@@ -452,14 +452,14 @@ export class SessionPool {
     };
   }
 
-  async compactSession(chatId: number): Promise<string> {
+  async compactSession(chatId: string | number): Promise<string> {
     const entry = await this.getSession(chatId);
     const result: any = await entry.session.compact();
     const tokensBefore = result?.tokensBefore ?? result?.originalTokens ?? "context";
     return `Compacted session successfully (tokens before: ${tokensBefore})`;
   }
 
-  async abortPrompt(chatId: number): Promise<boolean> {
+  async abortPrompt(chatId: string | number): Promise<boolean> {
     const entry = this.sessions.get(chatId);
     if (entry && (entry.isProcessing || entry.session.isStreaming)) {
       entry.aborted = true;

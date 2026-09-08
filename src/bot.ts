@@ -12,6 +12,7 @@ import { cronScheduler } from "./cron-scheduler";
 import { healthMonitor } from "./health-monitor";
 import { sessionArchiver } from "./session-archiver";
 import { SingleInstanceGuard } from "./single-instance-lock";
+import { discordClient } from "./discord-bot";
 import {
   splitMessage,
   formatToolStatus,
@@ -1553,6 +1554,16 @@ async function main() {
   console.log("Initializing Cron Scheduler...");
   cronScheduler.init(bot);
 
+  // Initialize Discord Gateway if token is provided
+  if (config.discordBotToken) {
+    try {
+      console.log("Starting Discord Gateway client...");
+      await discordClient.login(config.discordBotToken);
+    } catch (dErr: any) {
+      console.error("⚠️ Failed to initialize Discord Gateway:", dErr.message);
+    }
+  }
+
   console.log("Starting Pi Telegram Gateway with Concurrent Runner...");
 
   let runner: RunnerHandle | null = null;
@@ -1591,6 +1602,11 @@ async function main() {
         healthMonitor.destroy();
         cronScheduler.destroy();
         sessionPool.destroy();
+        try {
+          if (discordClient.isReady()) {
+            await discordClient.destroy();
+          }
+        } catch {}
         try {
           if (runner && runner.isRunning()) {
             await runner.stop();

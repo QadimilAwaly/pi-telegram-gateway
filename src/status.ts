@@ -82,7 +82,10 @@ async function main() {
   );
   console.log(`🆔 PID:                ${state.pid}`);
   console.log(`⏱️  Uptime:             ${formatUptime(state.uptimeSeconds)}`);
-  console.log(`🤖 Bot Handle:         @${state.botUsername} (ID: ${state.botId})`);
+  console.log(`📱 Telegram Bot:    @${state.botUsername} (ID: ${state.botId})`);
+  if (config.discordBotToken) {
+    console.log(`🎮 Discord Bot:     Hermes_maid_bot (Connected ⚡)`);
+  }
   console.log(
     `🔒 Access Control:      ${
       state.allowedUsersCount > 0
@@ -108,7 +111,7 @@ async function main() {
       { signal: AbortSignal.timeout(2000) }
     );
     if (tgRes.ok) {
-      const tgData = (await tgRes.json())?.result;
+      const tgData = ((await tgRes.json()) as any)?.result;
       const syncErr = tgData?.last_synchronization_error_date;
       if (!syncErr) {
         syncStatus = "\x1b[32mHealthy (Synchronized)\x1b[0m";

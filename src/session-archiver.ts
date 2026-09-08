@@ -29,11 +29,11 @@ export interface StorageStats {
 }
 
 export class SessionArchiver {
-  private getChatDir(chatId: number): string {
+  private getChatDir(chatId: string | number): string {
     return path.join(config.sessionsDir, `chat_${chatId}`);
   }
 
-  private getArchiveDir(chatId: number): string {
+  private getArchiveDir(chatId: string | number): string {
     const dir = path.join(this.getChatDir(chatId), ".archive");
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
@@ -41,11 +41,11 @@ export class SessionArchiver {
     return dir;
   }
 
-  private getIndexFile(chatId: number): string {
+  private getIndexFile(chatId: string | number): string {
     return path.join(this.getArchiveDir(chatId), "index.json");
   }
 
-  private loadIndex(chatId: number): ArchivedSessionMeta[] {
+  private loadIndex(chatId: string | number): ArchivedSessionMeta[] {
     const idxFile = this.getIndexFile(chatId);
     if (!fs.existsSync(idxFile)) return [];
     try {
@@ -56,7 +56,7 @@ export class SessionArchiver {
     }
   }
 
-  private saveIndex(chatId: number, list: ArchivedSessionMeta[]) {
+  private saveIndex(chatId: string | number, list: ArchivedSessionMeta[]) {
     const idxFile = this.getIndexFile(chatId);
     fs.writeFileSync(idxFile, JSON.stringify(list, null, 2), "utf-8");
   }
@@ -155,7 +155,7 @@ except Exception as e:
    * Archive inactive session files (Gzip compression + Mnemosyne distillation)
    */
   async archiveInactiveSessions(
-    chatId: number,
+    chatId: string | number,
     options: {
       keepLatest?: number;
       exportMarkdown?: boolean;
@@ -260,7 +260,7 @@ except Exception as e:
   /**
    * Restore an archived session back into the active directory
    */
-  restoreSession(chatId: number, archiveId: string): { ok: boolean; restoredFile?: string; error?: string } {
+  restoreSession(chatId: string | number, archiveId: string): { ok: boolean; restoredFile?: string; error?: string } {
     const index = this.loadIndex(chatId);
     const metaIdx = index.findIndex((m) => m.archiveId === archiveId || m.originalFileName.includes(archiveId));
     if (metaIdx === -1) {
@@ -299,7 +299,7 @@ except Exception as e:
   /**
    * Get comprehensive storage statistics
    */
-  getStorageStats(chatId: number): StorageStats {
+  getStorageStats(chatId: string | number): StorageStats {
     const chatDir = this.getChatDir(chatId);
     const archiveDir = this.getArchiveDir(chatId);
 
@@ -341,7 +341,7 @@ except Exception as e:
   /**
    * List all archived sessions
    */
-  listArchived(chatId: number): ArchivedSessionMeta[] {
+  listArchived(chatId: string | number): ArchivedSessionMeta[] {
     return this.loadIndex(chatId);
   }
 

@@ -7,7 +7,9 @@ dotenv.config();
 
 export interface GatewayConfig {
   botToken: string;
+  discordBotToken: string;
   allowedUsers: number[];
+  discordAllowedUsers: string[];
   defaultCwd: string;
   sessionsDir: string;
   defaultProvider?: string;
@@ -27,7 +29,12 @@ const defaultHome = os.homedir();
 
 export const config: GatewayConfig = {
   botToken: process.env.TELEGRAM_BOT_TOKEN || "",
+  discordBotToken: process.env.DISCORD_BOT_TOKEN || "",
   allowedUsers: parseAllowedUsers(process.env.ALLOWED_USERS),
+  discordAllowedUsers: (process.env.DISCORD_ALLOWED_USERS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
   defaultCwd: process.env.DEFAULT_CWD || defaultHome,
   sessionsDir:
     process.env.SESSIONS_DIR || path.join(defaultHome, ".pi", "telegram-sessions"),
