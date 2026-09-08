@@ -105,6 +105,7 @@ async function executeDiscordCommand(
       "• `/cron` — View or manage scheduled background tasks (inherited from Telegram)",
       "• `/cron run <id>` — Trigger and execute a scheduled cron task immediately",
       "• `/set-home` — Set current channel as the permanent destination for cron reports",
+      "• `/logs [count|error|clear]` — View live gateway execution logs and errors",
       "• `/new` or `/reset` — Clear active context and start a fresh session",
       "• `/compact` — Compact and summarize current conversation history",
       "• `/abort` or `/stop` — Instantly terminate currently running agent turn",
@@ -112,6 +113,48 @@ async function executeDiscordCommand(
       "Simply type any coding task or question to get started!",
     ].join("\n");
     await reply(help);
+    return true;
+  }
+
+  // /logs or /log
+  if (commandName === "logs" || commandName === "log") {
+    const rawArgs = args.join(" ").trim().toLowerCase();
+
+    // Clear logs
+    if (rawArgs === "clear") {
+      const success = gatewayLogger.clearLogs();
+      await reply(success ? "🗑️ **Gateway logs cleared successfully.**" : "⚠️ Failed to clear gateway logs.");
+      return true;
+    }
+
+    // Filter errors or custom count
+    const isErrorFilter = rawArgs === "error" || rawArgs === "errors" || rawArgs === "warn";
+    const numArg = parseInt(rawArgs, 10);
+    const limit = !isNaN(numArg) && numArg > 0 ? Math.min(numArg, 40) : isErrorFilter ? 20 : 15;
+
+    const entries = gatewayLogger.getRecentLogs({
+      limit,
+      level: isErrorFilter ? (rawArgs.includes("warn") ? "WARN" : "ERROR") : "ALL",
+    });
+
+    if (entries.length === 0) {
+      await reply(`🪵 **No logs recorded matching criteria.**\nFile: \`${gatewayLogger.getLogFilePath()}\``);
+      return true;
+    }
+
+    const logLines = entries
+      .map((e) => {
+        const lvlIcon = e.level === "ERROR" ? "❌" : e.level === "WARN" ? "⚠️" : "ℹ️";
+        const timeOnly = e.timeStr.includes(",") ? e.timeStr.split(",")[1]?.trim() : e.timeStr;
+        return `${timeOnly} ${lvlIcon} [${e.level}] ${e.message}`;
+      })
+      .join("\n");
+
+    const fileSize = gatewayLogger.getLogFileSizeKb();
+    const title = `🪵 **Pi Gateway Logs** (${entries.length} recent, file: ${fileSize} KB):\n\n`;
+    const codeBlock = `\`\`\`text\n${logLines.slice(-1800)}\n\`\`\`\n*Filter:* \`/logs error\` | *Count:* \`/logs 30\` | *Clear:* \`/logs clear\``;
+
+    await reply(title + codeBlock);
     return true;
   }
 
@@ -515,59 +558,157 @@ discordClient.on("messageCreate", async (message: Message) => {
   }, 4000);
   (message.channel as any).sendTyping().catch(() => {});
 
+  // Immediate progressive status message
   let statusMsg: Message | null = null;
-  let fullResponse = "";
+  try {
+    statusMsg = await message.reply("🧠 *Thinking...*");
+  } catch (err: any) {
+    console.error("Failed to send initial thinking message:", err.message);
+  }
 
-  const sendFinalResponse = async (text: string) => {
-    if (!text || !text.trim()) return;
-    if (statusMsg) {
-      await (statusMsg as any).delete().catch(() => {});
-      statusMsg = null;
-    }
-    const chunks = splitDiscordMessage(text);
-    for (const chunk of chunks) {
-      await message.reply(chunk);
+  let fullResponse = "";
+  let lastEditTime = 0;
+  let pendingEditTimer: any = null;
+  let currentToolStatus = "";
+  const toolHistory: string[] = [];
+
+  const updateDiscordStatus = async (text: string) => {
+    if (!statusMsg) return;
+    try {
+      await (statusMsg as any).edit(text.slice(0, 1950));
+    } catch {}
+  };
+
+  const scheduleProgressUpdate = () => {
+    const now = Date.now();
+    if (now - lastEditTime >= 1200) {
+      lastEditTime = now;
+      if (pendingEditTimer) {
+        clearTimeout(pendingEditTimer);
+        pendingEditTimer = null;
+      }
+      let display = "";
+      if (currentToolStatus) {
+        display = currentToolStatus;
+        if (toolHistory.length > 0) {
+          const prev = toolHistory.slice(-2).join("\n");
+          display = `${prev}\n${currentToolStatus}`;
+        }
+      } else if (fullResponse.trim()) {
+        display = fullResponse.length > 1800 ? fullResponse.slice(0, 1800) + "..." : fullResponse + " ▌";
+      } else {
+        display = "🧠 *Thinking...*";
+      }
+      updateDiscordStatus(display);
+    } else if (!pendingEditTimer) {
+      pendingEditTimer = setTimeout(() => {
+        pendingEditTimer = null;
+        lastEditTime = Date.now();
+        let display = "";
+        if (currentToolStatus) {
+          display = currentToolStatus;
+          if (toolHistory.length > 0) {
+            const prev = toolHistory.slice(-2).join("\n");
+            display = `${prev}\n${currentToolStatus}`;
+          }
+        } else if (fullResponse.trim()) {
+          display = fullResponse.length > 1800 ? fullResponse.slice(0, 1800) + "..." : fullResponse + " ▌";
+        } else {
+          display = "🧠 *Thinking...*";
+        }
+        updateDiscordStatus(display);
+      }, 1200 - (now - lastEditTime));
     }
   };
 
   try {
     const unsub = entry.session.subscribe(async (event: any) => {
-      // 1. Tool execution progress
-      if (event.type === "tool_start") {
-        const toolStatus = formatDiscordToolStatus(event.name, JSON.stringify(event.input || {}));
-        if (!statusMsg) {
-          statusMsg = await message.reply(toolStatus).catch(() => null);
-        } else {
-          await (statusMsg as any).edit(toolStatus).catch(() => {});
-        }
+      // 1. Tool execution start
+      if (event.type === "tool_execution_start") {
+        currentToolStatus = formatDiscordToolStatus(event.toolName, event.args);
+        console.log(`⚙️ [Discord Tool Call] ${event.toolName}: ${JSON.stringify(event.args || {})}`);
+        scheduleProgressUpdate();
       }
 
-      // 2. Stream tokens / turn finish
-      if (event.type === "message_update" && event.message?.content) {
-        for (const part of event.message.content) {
-          if (part.type === "text" && part.text) {
-            fullResponse = part.text;
+      // 2. Tool execution end
+      if (event.type === "tool_execution_end") {
+        const icon = event.isError ? "❌" : "✅";
+        const doneLine = `${icon} \`${event.toolName}\``;
+        toolHistory.push(doneLine);
+        if (toolHistory.length > 3) toolHistory.shift();
+        currentToolStatus = "";
+        scheduleProgressUpdate();
+      }
+
+      // 3. Assistant text streaming
+      if (event.type === "message_update") {
+        if (event.assistantMessageEvent?.type === "text_delta") {
+          fullResponse += event.assistantMessageEvent.delta;
+          if (!currentToolStatus) {
+            scheduleProgressUpdate();
           }
         }
       }
 
+      // 4. Turn end
       if (event.type === "turn_end") {
         clearInterval(typingInterval);
-        const duration = ((Date.now() - turnStartTime) / 1000).toFixed(2);
-        console.log(`✅ [Discord Turn Complete] Finished in ${duration}s.`);
-        await sendFinalResponse(fullResponse);
+        if (pendingEditTimer) {
+          clearTimeout(pendingEditTimer);
+          pendingEditTimer = null;
+        }
       }
     });
 
     await entry.session.prompt(promptText, imageAttachments.length > 0 ? (imageAttachments as any) : undefined);
     unsub();
+
+    // Finalize response
+    clearInterval(typingInterval);
+    if (pendingEditTimer) {
+      clearTimeout(pendingEditTimer);
+      pendingEditTimer = null;
+    }
+
+    const duration = ((Date.now() - turnStartTime) / 1000).toFixed(2);
+    console.log(`✅ [Discord Turn Complete] Finished in ${duration}s.`);
+
+    if (!fullResponse.trim()) {
+      if (statusMsg) {
+        await (statusMsg as any).edit("✅ *Done.*").catch(() => {});
+      }
+      return;
+    }
+
+    const chunks = splitDiscordMessage(fullResponse);
+    if (statusMsg && chunks.length > 0 && chunks[0]) {
+      // Transform statusMsg into chunk 0 in-place
+      await (statusMsg as any).edit(chunks[0]).catch(async () => {
+        await message.reply(chunks[0]!);
+      });
+      // Send remaining chunks
+      for (let i = 1; i < chunks.length; i++) {
+        if (chunks[i]) {
+          await message.reply(chunks[i]!).catch(() => {});
+        }
+      }
+    } else {
+      for (const chunk of chunks) {
+        await message.reply(chunk).catch(() => {});
+      }
+    }
   } catch (err: any) {
     clearInterval(typingInterval);
+    if (pendingEditTimer) clearTimeout(pendingEditTimer);
     console.error("❌ [Discord Prompt Error]:", err.message);
-    if (statusMsg) await (statusMsg as any).delete().catch(() => {});
-    await message.reply(`⚠️ **Execution Error**: ${err.message}`);
+    if (statusMsg) {
+      await (statusMsg as any).edit(`⚠️ **Execution Error**: ${err.message}`).catch(() => {});
+    } else {
+      await message.reply(`⚠️ **Execution Error**: ${err.message}`).catch(() => {});
+    }
   } finally {
     clearInterval(typingInterval);
+    if (pendingEditTimer) clearTimeout(pendingEditTimer);
     entry.isProcessing = false;
   }
 });

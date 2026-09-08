@@ -69,11 +69,11 @@ export function splitDiscordMessage(text: string, maxLength: number = 1950): str
 /**
  * Formats tool execution progress cleanly for Discord
  */
-export function formatDiscordToolStatus(name: string, input?: string): string {
+export function formatDiscordToolStatus(name: string, input?: any): string {
   let paramPreview = "";
   if (input) {
-    try {
-      const parsed = JSON.parse(input);
+    const parsed = typeof input === "string" ? (() => { try { return JSON.parse(input); } catch { return null; } })() : input;
+    if (parsed) {
       if (parsed.command) {
         paramPreview = `\`${parsed.command.slice(0, 60)}${parsed.command.length > 60 ? "..." : ""}\``;
       } else if (parsed.path) {
@@ -81,7 +81,7 @@ export function formatDiscordToolStatus(name: string, input?: string): string {
       } else if (parsed.query) {
         paramPreview = `"${parsed.query.slice(0, 50)}"`;
       }
-    } catch {
+    } else if (typeof input === "string") {
       paramPreview = input.slice(0, 50);
     }
   }
@@ -95,6 +95,7 @@ export function formatDiscordToolStatus(name: string, input?: string): string {
     fetch_webpage: "🌐",
     manage_plan: "📋",
     generate_image: "🎨",
+    recall_past_conversation: "🧠",
   };
 
   const icon = iconMap[name] || "🔧";
