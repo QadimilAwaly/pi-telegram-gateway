@@ -32,7 +32,7 @@ if (!config.botToken) {
 
 const bot = new Bot(config.botToken, {
   client: {
-    timeoutSeconds: 35,
+    timeoutSeconds: 55,
   },
 });
 
@@ -1720,12 +1720,12 @@ async function main() {
       }
 
       // Hardened long-polling runner:
-      // - 20s fetch timeout with 35s client timeout (prevents long-polling cutoffs and silent TCP NAT drops)
+      // - 41s fetch timeout matched with Discord WebSocket heartbeat (41.25s) and 55s client timeout
       // - Fixed 2000ms retryInterval (prevents unbounded exponential backoff lockup during Android sleep/network drops)
       runner = run(bot, {
         runner: {
           fetch: {
-            timeout: 20,
+            timeout: 41,
           },
           retryInterval: 2000,
         },
