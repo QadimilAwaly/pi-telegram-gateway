@@ -1,6 +1,11 @@
 import path from "path";
 import os from "os";
-import { createBashTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  createBashTool,
+  createEditTool,
+  createWriteTool,
+  type ExtensionAPI,
+} from "@earendil-works/pi-coding-agent";
 import { config } from "./config";
 
 const gatewayPid = process.pid;
@@ -43,18 +48,19 @@ export function isDangerousCommand(cmd: string): { blocked: boolean; reason?: st
     }
   }
 
-  // 3. Check destructive deletion targeting gateway directory or session storage
+  // 3. Check destructive deletion or modification targeting gateway codebase or session storage
   const dangerousDeletions = [
     /\brm\s+(-[a-zA-Z0-9_-]*r[a-zA-Z0-9_-]*\s+|--recursive\s+).*pi-telegram-gateway/i,
     /\brm\s+(-[a-zA-Z0-9_-]*r[a-zA-Z0-9_-]*\s+|--recursive\s+).*telegram-sessions/i,
     /\brm\s+.*pi-telegram-gateway\/\.env/i,
+    /\b(sed\s+-i|tee|cp|mv|cat\s*>|echo\s*>).*pi-telegram-gateway\/(src|scripts)/i,
   ];
 
   for (const pattern of dangerousDeletions) {
     if (pattern.test(trimmed)) {
       return {
         blocked: true,
-        reason: `Blocked destructive file deletion targeting gateway codebase or session database.`,
+        reason: `Blocked file modification/deletion targeting active gateway codebase or session database.`,
       };
     }
   }
@@ -125,6 +131,58 @@ export function gatewaySafetyExtension(pi: ExtensionAPI) {
           details: { error: true, message: err.message },
         };
       }
+    },
+  });
+
+  // 3. Intercept and override edit tool with active gateway codebase protection
+  const nativeEditTool = createEditTool(config.defaultCwd);
+  pi.registerTool({
+    ...nativeEditTool,
+    name: "edit",
+    label: "edit (gateway-protected)",
+    description: "Edit a file with active protection for the host gateway codebase.",
+    async execute(toolCallId, params: any, signal, onUpdate, ctx) {
+      const targetPath = path.resolve(ctx?.cwd || config.defaultCwd, params?.path || "");
+      if (
+        targetPath.startsWith(path.join(gatewayDir, "src")) ||
+        targetPath.startsWith(path.join(gatewayDir, "scripts")) ||
+        targetPath === path.join(gatewayDir, "package.json")
+      ) {
+        const reason = `Blocked edit targeting host gateway codebase (${targetPath}). Modifying the gateway source code from inside its own session is prohibited to prevent daemon crashes.`;
+        console.warn(`🛡️ [Safety Guard] Intercepted edit: ${reason}`);
+        return {
+          content: [{ type: "text", text: `🛡️ [Pi Gateway Safety Guard Error]: ${reason}` }],
+          details: { blocked: true, reason },
+        };
+      }
+      const toolToUse = ctx?.cwd ? createEditTool(ctx.cwd) : nativeEditTool;
+      return await toolToUse.execute(toolCallId, params, signal, onUpdate);
+    },
+  });
+
+  // 4. Intercept and override write tool with active gateway codebase protection
+  const nativeWriteTool = createWriteTool(config.defaultCwd);
+  pi.registerTool({
+    ...nativeWriteTool,
+    name: "write",
+    label: "write (gateway-protected)",
+    description: "Write a file with active protection for the host gateway codebase.",
+    async execute(toolCallId, params: any, signal, onUpdate, ctx) {
+      const targetPath = path.resolve(ctx?.cwd || config.defaultCwd, params?.path || "");
+      if (
+        targetPath.startsWith(path.join(gatewayDir, "src")) ||
+        targetPath.startsWith(path.join(gatewayDir, "scripts")) ||
+        targetPath === path.join(gatewayDir, "package.json")
+      ) {
+        const reason = `Blocked write targeting host gateway codebase (${targetPath}). Modifying the gateway source code from inside its own session is prohibited to prevent daemon crashes.`;
+        console.warn(`🛡️ [Safety Guard] Intercepted write: ${reason}`);
+        return {
+          content: [{ type: "text", text: `🛡️ [Pi Gateway Safety Guard Error]: ${reason}` }],
+          details: { blocked: true, reason },
+        };
+      }
+      const toolToUse = ctx?.cwd ? createWriteTool(ctx.cwd) : nativeWriteTool;
+      return await toolToUse.execute(toolCallId, params, signal, onUpdate);
     },
   });
 }
