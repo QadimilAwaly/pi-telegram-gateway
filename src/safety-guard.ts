@@ -37,13 +37,14 @@ export function isDangerousCommand(cmd: string): { blocked: boolean; reason?: st
     /\bpkill\s+.*(bot\.ts|pi-telegram-gateway|run\.sh|cron-scheduler)/i,
     /\bkill\s+.*\$\(pgrep.*(bun|bot|gateway)/i,
     /\bkill\s+.*\`pgrep.*(bun|bot|gateway)/i,
+    /\b(bash\s+|sh\s+|\.\/)?.*(restart\.sh|pi-gateway\s+restart|npm\s+run\s+restart)\b/i,
   ];
 
   for (const pattern of patternKillers) {
     if (pattern.test(trimmed)) {
       return {
         blocked: true,
-        reason: `Blocked process killer command that would terminate the active Telegram gateway.`,
+        reason: `Blocked process killer/restart command that would terminate the active host gateway daemon.`,
       };
     }
   }
