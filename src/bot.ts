@@ -36,6 +36,38 @@ const bot = new Bot(config.botToken, {
   },
 });
 
+// Network Outage & Recovery Monitor for Telegram Long-Polling
+let isNetworkDown = false;
+let networkDownSince = 0;
+let failedPollAttempts = 0;
+
+bot.api.config.use(async (prev, method, payload, signal) => {
+  try {
+    const res = await prev(method, payload, signal);
+    if (method === "getUpdates" && isNetworkDown) {
+      const downtimeSec = Math.round((Date.now() - networkDownSince) / 1000);
+      console.log(
+        `🌐 [Network Restored] Telegram connection recovered after ${downtimeSec}s (${failedPollAttempts} retries). Long-polling resumed.`
+      );
+      isNetworkDown = false;
+      failedPollAttempts = 0;
+    }
+    return res;
+  } catch (err: any) {
+    if (method === "getUpdates") {
+      failedPollAttempts++;
+      if (!isNetworkDown) {
+        isNetworkDown = true;
+        networkDownSince = Date.now();
+        console.warn(
+          `⚠️ [Network Outage] Telegram getUpdates unreachable (${err.message || "Network request failed"}). Gateway entering quiet auto-retry mode...`
+        );
+      }
+    }
+    throw err;
+  }
+});
+
 // Middleware: Access Control Whitelist
 bot.use(async (ctx, next) => {
   const updateType = Object.keys(ctx.update).filter((k) => k !== "update_id").join(",");
@@ -1722,12 +1754,14 @@ async function main() {
       // Hardened long-polling runner:
       // - 41s fetch timeout matched with Discord WebSocket heartbeat (41.25s) and 55s client timeout
       // - Fixed 2000ms retryInterval (prevents unbounded exponential backoff lockup during Android sleep/network drops)
+      // - silent: true suppresses repetitive runner stack trace dumping during network drops
       runner = run(bot, {
         runner: {
           fetch: {
             timeout: 41,
           },
           retryInterval: 2000,
+          silent: true,
         },
       });
 

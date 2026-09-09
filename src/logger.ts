@@ -25,6 +25,13 @@ export class GatewayLogger {
   } | null = null;
   private isInitialized: boolean = false;
 
+  // Duplicate suppression state
+  private lastMessage: string = "";
+  private lastLevel: LogLevel = "INFO";
+  private repeatCount: number = 0;
+  private lastRepeatReported: number = 0;
+  private lastLogTimestamp: number = 0;
+
   constructor() {
     this.logFile = path.join(config.sessionsDir, "gateway.log");
   }
@@ -134,12 +141,7 @@ export class GatewayLogger {
     } catch {}
   }
 
-  private write(level: LogLevel, args: any[]) {
-    const rawMsg = this.formatArgs(args);
-    const cleanMsg = stripAnsi(rawMsg).trim();
-    if (!cleanMsg) return;
-
-    const now = new Date();
+  private commitEntry(level: LogLevel, cleanMsg: string, now: Date = new Date()) {
     const timeStr = now.toLocaleString("id-ID", {
       timeZone: "Asia/Makassar",
       dateStyle: "short",
@@ -147,7 +149,7 @@ export class GatewayLogger {
     });
 
     const entry: LogEntry = {
-      timestamp: Date.now(),
+      timestamp: now.getTime(),
       timeStr,
       level,
       message: cleanMsg,
@@ -165,6 +167,56 @@ export class GatewayLogger {
       const line = `[${timeStr}] [${level}] ${cleanMsg}\n`;
       fs.appendFileSync(this.logFile, line, "utf-8");
     } catch {}
+  }
+
+  private flushDuplicates(now: Date = new Date()) {
+    if (this.repeatCount === 1) {
+      // Natural 2-time occurrences are logged as is without noisy suppress notices
+      this.commitEntry(this.lastLevel, this.lastMessage, now);
+    } else if (this.repeatCount > 1) {
+      const msg = `⚠️ [Suppressed] (Previous ${this.lastLevel} message repeated ${this.repeatCount} times)`;
+      this.commitEntry(this.lastLevel, msg, now);
+    }
+    this.repeatCount = 0;
+    this.lastRepeatReported = 0;
+  }
+
+  private write(level: LogLevel, args: any[]) {
+    const rawMsg = this.formatArgs(args);
+    const cleanMsg = stripAnsi(rawMsg).trim();
+    if (!cleanMsg) return;
+
+    const now = new Date();
+
+    // Check for consecutive duplicate
+    if (cleanMsg === this.lastMessage && level === this.lastLevel) {
+      this.repeatCount++;
+
+      // If it repeats extensively, emit an update periodically
+      const nowMs = now.getTime();
+      const shouldReportMilestone =
+        (this.repeatCount === 10 && this.lastRepeatReported < 10) ||
+        (this.repeatCount === 50 && this.lastRepeatReported < 50) ||
+        (this.repeatCount === 100 && this.lastRepeatReported < 100) ||
+        (this.repeatCount % 500 === 0 && this.repeatCount > this.lastRepeatReported) ||
+        (nowMs - this.lastLogTimestamp >= 60000 && this.repeatCount > this.lastRepeatReported);
+
+      if (shouldReportMilestone) {
+        const msg = `⚠️ [Suppressed] (Message repeated ${this.repeatCount} times so far...)`;
+        this.commitEntry(level, msg, now);
+        this.lastRepeatReported = this.repeatCount;
+        this.lastLogTimestamp = nowMs;
+      }
+      return;
+    }
+
+    // A different message arrived -> flush pending suppressed duplicates
+    this.flushDuplicates(now);
+
+    this.lastMessage = cleanMsg;
+    this.lastLevel = level;
+    this.lastLogTimestamp = now.getTime();
+    this.commitEntry(level, cleanMsg, now);
   }
 
   info(...args: any[]) {
@@ -195,6 +247,9 @@ export class GatewayLogger {
    * Get recent log entries for display or inspection
    */
   getRecentLogs(options: { limit?: number; level?: LogLevel | "ALL" } = {}): LogEntry[] {
+    if (this.repeatCount > 0) {
+      this.flushDuplicates();
+    }
     const limit = Math.min(options.limit || 20, 100);
     const level = options.level || "ALL";
 
@@ -217,6 +272,9 @@ export class GatewayLogger {
    */
   clearLogs(): boolean {
     this.ringBuffer = [];
+    this.lastMessage = "";
+    this.repeatCount = 0;
+    this.lastRepeatReported = 0;
     try {
       if (fs.existsSync(this.logFile)) {
         fs.writeFileSync(this.logFile, "", "utf-8");
