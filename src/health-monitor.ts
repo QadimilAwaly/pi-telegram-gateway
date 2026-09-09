@@ -28,7 +28,6 @@ export class HealthMonitor {
   private healthFile: string;
   private startTime: number = Date.now();
   private botInfo: { username: string; id: number } | null = null;
-  private heartbeatTimer: any = null;
   private httpServer: any = null;
 
   constructor() {
@@ -39,14 +38,8 @@ export class HealthMonitor {
     this.botInfo = botInfo;
     this.startTime = Date.now();
 
-    // 1. Initial snapshot & 60s relaxed interval update (minimizes disk I/O and CPU wakeups)
+    // 1. Initial snapshot on boot (0 periodic timers, 0 disk I/O when idle)
     this.updateSnapshot();
-    this.heartbeatTimer = setInterval(() => {
-      this.updateSnapshot();
-    }, 60_000);
-    if (this.heartbeatTimer?.unref) {
-      this.heartbeatTimer.unref();
-    }
 
     // 2. Local loopback HTTP health server on 127.0.0.1:4080
     try {
@@ -126,10 +119,6 @@ export class HealthMonitor {
   }
 
   destroy() {
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
-    }
     if (this.httpServer) {
       try {
         this.httpServer.stop();

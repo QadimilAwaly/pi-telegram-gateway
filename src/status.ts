@@ -72,14 +72,7 @@ async function main() {
     process.exit(0);
   }
 
-  const timeSinceHeartbeat = Math.floor((Date.now() - state.lastHeartbeat) / 1000);
-  const isHeartbeatHealthy = timeSinceHeartbeat < 90;
-
-  console.log(
-    `🟢 STATUS:             \x1b[32mONLINE (Active)\x1b[0m ${
-      isHeartbeatHealthy ? "⚡" : "\x1b[33m(Heartbeat Delayed)\x1b[0m"
-    }`
-  );
+  console.log(`⚡ STATUS:             \x1b[32mONLINE (Active)\x1b[0m ⚡`);
   console.log(`🆔 PID:                ${state.pid}`);
   console.log(`⏱️  Uptime:             ${formatUptime(state.uptimeSeconds)}`);
   if (config.mode === "discord") {
