@@ -1,3 +1,4 @@
+import { getActiveTunnelInfo, startTunnel, stopTunnel, type TunnelInfo } from "./tunnel-manager";
 import path from "path";
 import fs from "fs";
 import { execFile } from "node:child_process";
@@ -320,6 +321,132 @@ function formatCompactTokens(num: number): string {
   return String(num);
 }
 
+const handleTunnelOpen = async (ctx: Context) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return;
+
+  const text = ctx.message?.text || "";
+  const force = /\b(force|new|reset|restart)\b/i.test(text);
+
+  const statusMsg = await ctx.reply(
+    "⏳ <b>Menghubungkan SSH tunnel ke Cloudflare...</b>\nMohon tunggu...",
+    { parse_mode: "HTML" }
+  );
+
+  const res = await startTunnel(force);
+  const keyboard = res.alreadyActive
+    ? new InlineKeyboard().text("🔄 Restart Tunnel", "tunnel:restart").text("🛑 Tutup Tunnel", "tunnel:close")
+    : new InlineKeyboard().text("🛑 Tutup Tunnel", "tunnel:close");
+  try {
+    await ctx.api.editMessageText(chatId, statusMsg.message_id, res.message, {
+      parse_mode: "HTML",
+      reply_markup: keyboard,
+    });
+  } catch {
+    await ctx.reply(res.message, {
+      parse_mode: "HTML",
+      reply_markup: keyboard,
+    });
+  }
+};
+
+const handleTunnelClose = async (ctx: Context) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return;
+
+  await ctx.replyWithChatAction("typing");
+  const res = await stopTunnel();
+  await ctx.reply(res.message, { parse_mode: "HTML" });
+};
+
+// Command: /tunnel-open, /tunnel_open
+bot.hears(/^\/tunnel[-_]?open(?:@\w+)?(?:\s+.*)?$/i, handleTunnelOpen);
+bot.command(["tunnel_open", "tunnelopen"], handleTunnelOpen);
+
+// Command: /tunnel-close, /tunnel_close, /tunnel-stop, /tunnel_stop
+bot.hears(/^\/tunnel[-_]?(?:close|stop)(?:@\w+)?(?:\s+.*)?$/i, handleTunnelClose);
+bot.command(["tunnel_close", "tunnelclose", "tunnel_stop", "tunnelstop"], handleTunnelClose);
+
+// Command: /tunnel (status or toggle)
+bot.hears(/^\/tunnel(?:@\w+)?(?:\s+(.*))?$/i, async (ctx) => {
+  const match = ctx.match as RegExpMatchArray | undefined;
+  const arg = (match && match[1] ? match[1] : "").trim().toLowerCase();
+  if (arg === "open" || arg === "start") {
+    return handleTunnelOpen(ctx);
+  }
+  if (arg === "close" || arg === "stop") {
+    return handleTunnelClose(ctx);
+  }
+  const info = getActiveTunnelInfo();
+  if (info.active && info.url) {
+    return handleTunnelOpen(ctx);
+  } else {
+    const keyboard = new InlineKeyboard().text("🚀 Buka Tunnel", "tunnel:restart");
+    await ctx.reply(
+      "⚪ <b>Cloudflare SSH Tunnel saat ini INAKTIF.</b>\nKetik <code>/tunnel-open</code> untuk mengaktifkan akses SSH remote.",
+      { parse_mode: "HTML", reply_markup: keyboard }
+    );
+  }
+});
+bot.command("tunnel", async (ctx) => {
+  const text = ctx.message?.text || "";
+  const parts = text.split(/\s+/);
+  const arg = (parts[1] || "").toLowerCase();
+  if (arg === "open" || arg === "start") {
+    return handleTunnelOpen(ctx);
+  }
+  if (arg === "close" || arg === "stop") {
+    return handleTunnelClose(ctx);
+  }
+  const info = getActiveTunnelInfo();
+  if (info.active && info.url) {
+    return handleTunnelOpen(ctx);
+  } else {
+    const keyboard = new InlineKeyboard().text("🚀 Buka Tunnel", "tunnel:restart");
+    await ctx.reply(
+      "⚪ <b>Cloudflare SSH Tunnel saat ini INAKTIF.</b>\nKetik <code>/tunnel-open</code> untuk mengaktifkan akses SSH remote.",
+      { parse_mode: "HTML", reply_markup: keyboard }
+    );
+  }
+});
+
+// Inline Callbacks for Tunnel Management
+bot.callbackQuery("tunnel:close", async (ctx) => {
+  await ctx.answerCallbackQuery({ text: "Menutup tunnel..." });
+  const res = await stopTunnel();
+  if (ctx.callbackQuery.message) {
+    try {
+      await ctx.editMessageText(res.message, { parse_mode: "HTML" });
+      return;
+    } catch {}
+  }
+  await ctx.reply(res.message, { parse_mode: "HTML" });
+});
+
+bot.callbackQuery("tunnel:restart", async (ctx) => {
+  await ctx.answerCallbackQuery({ text: "Memulai / merestart tunnel..." });
+  if (ctx.callbackQuery.message) {
+    try {
+      await ctx.editMessageText("⏳ <b>Menghubungkan SSH tunnel ke Cloudflare...</b>\nMohon tunggu...", { parse_mode: "HTML" });
+    } catch {}
+  }
+  const res = await startTunnel(true);
+  const keyboard = new InlineKeyboard().text("🛑 Tutup Tunnel", "tunnel:close");
+  if (ctx.callbackQuery.message) {
+    try {
+      await ctx.editMessageText(res.message, {
+        parse_mode: "HTML",
+        reply_markup: keyboard,
+      });
+      return;
+    } catch {}
+  }
+  await ctx.reply(res.message, {
+    parse_mode: "HTML",
+    reply_markup: keyboard,
+  });
+});
+
 // Command: /status
 bot.command("status", async (ctx) => {
   const chatId = ctx.chat?.id;
@@ -338,12 +465,17 @@ bot.command("status", async (ctx) => {
     const contextPercent = maxContextTokens > 0 ? ((usedContextTokens / maxContextTokens) * 100).toFixed(1) : "0.0";
 
     const batteryInfo = await getDeviceBatteryStatus();
+    const tunnelInfo = getActiveTunnelInfo();
+    const tunnelStatusStr = tunnelInfo.active && tunnelInfo.url
+      ? `🟢 Aktif (<code>${escapeHtml(tunnelInfo.host || tunnelInfo.url)}</code>)`
+      : "⚪ Inaktif";
 
     const statusMsg = [
       "📊 <b>Pi Session Status</b>",
       `• <b>Session ID:</b> <code>${escapeHtml(session.sessionId)}</code>`,
       `• <b>Model:</b> <code>${escapeHtml(model ? `${model.provider}/${model.id}` : "default")}</code>`,
       `• <b>Thinking Level:</b> <code>${escapeHtml(session.thinkingLevel || "off")}</code>`,
+      `• <b>SSH Tunnel:</b> ${tunnelStatusStr}`,
       `• <b>Context Window:</b> <code>${formatNumber(usedContextTokens)} / ${formatNumber(maxContextTokens)} tokens (${contextPercent}%)</code>`,
     ];
 

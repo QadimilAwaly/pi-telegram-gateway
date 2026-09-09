@@ -11,6 +11,7 @@ import { config } from "./config";
 import { sessionPool, type Model } from "./session-pool";
 import { cronScheduler } from "./cron-scheduler";
 import { splitDiscordMessage, formatDiscordToolStatus } from "./discord-utils";
+import { getActiveTunnelInfo, startTunnel, stopTunnel } from "./tunnel-manager";
 import { gatewayLogger } from "./logger";
 
 gatewayLogger.init();
@@ -354,6 +355,33 @@ async function executeDiscordCommand(
       await reply(report);
     } catch (err: any) {
       await reply(`⚠️ Gagal mengambil cron jobs: ${err.message}`);
+    }
+    return true;
+  }
+
+  // /tunnel, /tunnel-open, /tunnel-close
+  if (commandName === "tunnel" || commandName === "tunnel-open" || commandName === "tunnel-close") {
+    const sub = args[0]?.toLowerCase();
+    if (commandName === "tunnel-close" || sub === "close" || sub === "stop") {
+      const res = await stopTunnel();
+      await reply(res.message.replace(/<[^>]*>/g, ""));
+      return true;
+    }
+    if (commandName === "tunnel-open" || sub === "open" || sub === "start" || sub === "restart") {
+      await reply("⏳ **Menghubungkan SSH tunnel ke Cloudflare...** Mohon tunggu...");
+      const res = await startTunnel(sub === "restart");
+      await reply(res.message.replace(/<[^>]*>/g, ""));
+      return true;
+    }
+    const info = getActiveTunnelInfo();
+    if (info.active && info.url) {
+      const username = process.env.USER || "u0_a239";
+      const sshCmd = `ssh -p 8022 -o ProxyCommand='cloudflared access ssh --hostname %h' ${username}@${info.host}`;
+      await reply(
+        `🟢 **SSH Cloudflare Tunnel Aktif!**\n• **URL:** \`${info.url}\`\n• **Host:** \`${info.host}\`\n• **PID:** \`${info.pid}\`\n\n**Perintah SSH:**\n\`${sshCmd}\``
+      );
+    } else {
+      await reply("⚪ **Cloudflare SSH Tunnel saat ini INAKTIF.**\nKetik `/tunnel-open` untuk membuka akses remote.");
     }
     return true;
   }

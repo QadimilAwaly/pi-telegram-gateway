@@ -137,6 +137,22 @@ async function main() {
   }
 
   console.log(`🌐 Cloud Sync Status: ${syncStatus}`);
+  const tunnelPidFile = path.join(defaultHome, "pi-telegram-gateway", "tunnel.pid");
+  const tunnelUrlFile = path.join(defaultHome, "pi-telegram-gateway", "tunnel_url.txt");
+  let tunnelStatus = "\x1b[90mInactive\x1b[0m";
+  if (fs.existsSync(tunnelPidFile)) {
+    try {
+      const tPid = parseInt(fs.readFileSync(tunnelPidFile, "utf8").trim(), 10);
+      if (tPid && checkProcessAlive(tPid)) {
+        let tUrl = "";
+        if (fs.existsSync(tunnelUrlFile)) {
+          tUrl = fs.readFileSync(tunnelUrlFile, "utf8").trim();
+        }
+        tunnelStatus = `\x1b[32mActive (PID: ${tPid})\x1b[0m ${tUrl ? `\x1b[36m${tUrl}\x1b[0m` : ""}`;
+      }
+    } catch {}
+  }
+  console.log(`🔌 SSH Tunnel:         ${tunnelStatus}`);
   console.log(`⏰ Scheduled Cron:     \x1b[36m${state.activeCronJobs} active job(s)\x1b[0m`);
   console.log(`🩺 Health API:         http://127.0.0.1:4080/health`);
   console.log(`📁 Storage Path:       ${sessionsDir}`);
