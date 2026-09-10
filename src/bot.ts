@@ -1569,10 +1569,10 @@ bot.on(["message:text", "message:photo", "message:document"], async (ctx) => {
             ? content.filter((c: any) => c.type === "text").map((c: any) => c.text).join("\n").trim()
             : "";
           if (text) {
-            // Deliver assistant intermediate reply immediately (not deferred to turn end)
-            // so users see responses as they arrive, even mid-tool-calling.
+            // Set synchronously before any await so the turn-end loop sees it
+            // (prevents double-delivery race with async subscribe handler).
             intermediateDelivered = true;
-            await sendTurnResponse(text);
+            sendTurnResponse(text).catch(() => {});
           }
         }
       } else if (event.type === "agent_end") {
