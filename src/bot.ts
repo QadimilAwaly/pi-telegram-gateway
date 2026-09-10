@@ -1567,7 +1567,10 @@ bot.on(["message:text", "message:photo", "message:document"], async (ctx) => {
           const text = Array.isArray(content)
             ? content.filter((c: any) => c.type === "text").map((c: any) => c.text).join("\n").trim()
             : "";
-          if (!hasToolCalls && text) {
+          if (text) {
+            // Always push assistant text responses, even if they include tool calls
+            // (e.g., intermediate explanation while running a tool). This prevents
+            // the message being lost when the agent sends a reply mid-tool-calling.
             conversationalResponses.push(text);
           }
         }
