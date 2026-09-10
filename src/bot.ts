@@ -1568,10 +1568,9 @@ bot.on(["message:text", "message:photo", "message:document"], async (ctx) => {
             ? content.filter((c: any) => c.type === "text").map((c: any) => c.text).join("\n").trim()
             : "";
           if (text) {
-            // Always push assistant text responses, even if they include tool calls
-            // (e.g., intermediate explanation while running a tool). This prevents
-            // the message being lost when the agent sends a reply mid-tool-calling.
-            conversationalResponses.push(text);
+            // Deliver assistant intermediate reply immediately (not deferred to turn end)
+            // so users see responses as they arrive, even mid-tool-calling.
+            await sendTurnResponse(text);
           }
         }
       } else if (event.type === "agent_end") {
