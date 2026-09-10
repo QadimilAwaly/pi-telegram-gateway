@@ -1495,6 +1495,7 @@ bot.on(["message:text", "message:photo", "message:document"], async (ctx) => {
   let fullResponse = "";
   let modelErrorMessage: string | null = null;
   let statusMessageId: number | null = null;
+  let intermediateDelivered = false;
   const conversationalResponses: string[] = [];
   const toolLog: string[] = [];
 
@@ -1570,6 +1571,7 @@ bot.on(["message:text", "message:photo", "message:document"], async (ctx) => {
           if (text) {
             // Deliver assistant intermediate reply immediately (not deferred to turn end)
             // so users see responses as they arrive, even mid-tool-calling.
+            intermediateDelivered = true;
             await sendTurnResponse(text);
           }
         }
@@ -1649,14 +1651,17 @@ bot.on(["message:text", "message:photo", "message:document"], async (ctx) => {
       }
 
       // Deliver all completed conversational responses deterministically (prevents duplicate sends)
-      if (conversationalResponses.length > 0) {
-        for (const resp of conversationalResponses) {
-          await sendTurnResponse(resp);
+      // Skip final delivery if intermediate reply was already delivered immediately
+      if (!intermediateDelivered) {
+        if (conversationalResponses.length > 0) {
+          for (const resp of conversationalResponses) {
+            await sendTurnResponse(resp);
+          }
+        } else if (fullResponse && fullResponse.trim()) {
+          await sendTurnResponse(fullResponse);
+        } else {
+          await sendTurnResponse("*(Completed with no text output)*");
         }
-      } else if (fullResponse && fullResponse.trim()) {
-        await sendTurnResponse(fullResponse);
-      } else {
-        await sendTurnResponse("*(Completed with no text output)*");
       }
 
       const elapsedSec = ((Date.now() - turnStartTime) / 1000).toFixed(2);
