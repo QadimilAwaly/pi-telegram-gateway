@@ -9,7 +9,7 @@ import { run, type RunnerHandle } from "@grammyjs/runner";
 const execFileAsync = promisify(execFile);
 import { config } from "./config";
 import { sessionPool } from "./session-pool";
-import { cronScheduler } from "./cron-scheduler";
+import { cronScheduler, isValidCronExpression } from "./cron-scheduler";
 import { healthMonitor } from "./health-monitor";
 import { sessionArchiver } from "./session-archiver";
 import { SingleInstanceGuard } from "./single-instance-lock";
@@ -821,6 +821,93 @@ bot.command(["logs", "log"], async (ctx) => {
   }
 });
 
+function stripOuterQuotes(s: string): string {
+  const trimmed = s.trim();
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'") && trimmed.length >= 2)
+  ) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
+function parseAddScheduleAndPrompt(input: string): { id?: string; cronExpression: string; prompt: string } | null {
+  const trimmed = input.trim();
+  if (!trimmed) return null;
+
+  // 1. Quoted cron (with optional ID): [id] "cron" [prompt] or [id] 'cron' [prompt]
+  const doubleQuoted = trimmed.match(/^(?:([a-zA-Z0-9_-]+)\s+)?"([^"]+)"(?:\s+(.*))?$/s);
+  if (doubleQuoted && isValidCronExpression(doubleQuoted[2]!)) {
+    return {
+      id: doubleQuoted[1],
+      cronExpression: doubleQuoted[2]!.trim(),
+      prompt: stripOuterQuotes(doubleQuoted[3] || ""),
+    };
+  }
+  const singleQuoted = trimmed.match(/^(?:([a-zA-Z0-9_-]+)\s+)?'([^']+)'(?:\s+(.*))?$/s);
+  if (singleQuoted && isValidCronExpression(singleQuoted[2]!)) {
+    return {
+      id: singleQuoted[1],
+      cronExpression: singleQuoted[2]!.trim(),
+      prompt: stripOuterQuotes(singleQuoted[3] || ""),
+    };
+  }
+
+  // 2. Nicknames: [id] @daily [prompt]
+  const nickMatch = trimmed.match(/^(?:([a-zA-Z0-9_-]+)\s+)?(@[a-zA-Z0-9_-]+)(?:\s+(.*))?$/s);
+  if (nickMatch && isValidCronExpression(nickMatch[2]!)) {
+    return {
+      id: nickMatch[1],
+      cronExpression: nickMatch[2]!.trim(),
+      prompt: stripOuterQuotes(nickMatch[3] || ""),
+    };
+  }
+
+  // 3. Unquoted parts: 5 or 6 token cron
+  const parts = trimmed.split(/\s+/);
+  if (parts.length >= 5) {
+    const expr5 = parts.slice(0, 5).join(" ");
+    if (isValidCronExpression(expr5)) {
+      return {
+        id: undefined,
+        cronExpression: expr5,
+        prompt: stripOuterQuotes(parts.slice(5).join(" ")),
+      };
+    }
+  }
+  if (parts.length >= 6) {
+    const expr6 = parts.slice(0, 6).join(" ");
+    if (isValidCronExpression(expr6)) {
+      return {
+        id: undefined,
+        cronExpression: expr6,
+        prompt: stripOuterQuotes(parts.slice(6).join(" ")),
+      };
+    }
+    const withId5 = parts.slice(1, 6).join(" ");
+    if (isValidCronExpression(withId5)) {
+      return {
+        id: parts[0],
+        cronExpression: withId5,
+        prompt: stripOuterQuotes(parts.slice(6).join(" ")),
+      };
+    }
+  }
+  if (parts.length >= 7) {
+    const withId6 = parts.slice(1, 7).join(" ");
+    if (isValidCronExpression(withId6)) {
+      return {
+        id: parts[0],
+        cronExpression: withId6,
+        prompt: stripOuterQuotes(parts.slice(7).join(" ")),
+      };
+    }
+  }
+
+  return null;
+}
+
 // Command: /cron
 bot.command("cron", async (ctx) => {
   const chatId = ctx.chat?.id;
@@ -861,7 +948,7 @@ bot.command("cron", async (ctx) => {
       msg += `  • <b>Next Run:</b> <code>${escapeHtml(job.nextRun || "N/A")}</code>\n`;
       if (job.lastRun) {
         const lastRunStr = new Date(job.lastRun).toLocaleString("id-ID", {
-          timeZone: job.timezone || "Asia/Jakarta",
+          timeZone: job.timezone || config.defaultTimezone,
           dateStyle: "short",
           timeStyle: "short",
         });
@@ -937,8 +1024,9 @@ bot.command("cron", async (ctx) => {
         "⚠️ Usage: <code>/cron edit &lt;id&gt; [options]</code>\n\n" +
         "<b>Examples:</b>\n" +
         '• Ganti jadwal: <code>/cron edit my_job "0 8 * * *"</code>\n' +
+        '• Ganti jadwal (unquoted): <code>/cron edit my_job 0 8 * * *</code>\n' +
         '• Ganti jadwal & prompt: <code>/cron edit my_job "0 8 * * *" Cek berita AI</code>\n' +
-        '• Pakai flags: <code>/cron edit my_job --cron "0 9 * * *" --name "New Title"</code>\n' +
+        '• Pakai flags: <code>/cron edit my_job --cron "0 9 * * 1-5" --name "New Title"</code>\n' +
         '• Ganti mode: <code>/cron edit my_job --mode script</code> atau <code>--mode agent</code>',
         { parse_mode: "HTML" }
       );
@@ -956,7 +1044,7 @@ bot.command("cron", async (ctx) => {
     }
 
     if (!editArgs) {
-      const currentNext = cronScheduler.getNextRun(id);
+      const currentNext = cronScheduler.getNextRun(existingJob.id);
       const modeStr = existingJob.noAgent ? "⚡ Direct Script (0 LLM Tokens)" : "🧠 Agent Reasoning";
       const infoMsg = [
         `📋 <b>Edit Cron Job:</b> <code>${escapeHtml(existingJob.id)}</code>`,
@@ -982,46 +1070,39 @@ bot.command("cron", async (ctx) => {
     let newTz: string | undefined;
     let newNoAgent: boolean | undefined;
 
-    const cronMatch = editArgs.match(/--cron\s+["']?([^"'-]+)["']?/i);
-    if (cronMatch) newCron = cronMatch[1]?.trim();
-
-    const promptMatch = editArgs.match(/--prompt\s+["']?([^"']+)["']?/i);
-    if (promptMatch) newPrompt = promptMatch[1]?.trim();
-
-    const nameMatch = editArgs.match(/--name\s+["']?([^"']+)["']?/i);
-    if (nameMatch) newName = nameMatch[1]?.trim();
-
-    const tzMatch = editArgs.match(/--tz\s+["']?([^"'\s]+)["']?/i);
-    if (tzMatch) newTz = tzMatch[1]?.trim();
-
-    if (/--mode\s+script|--script/i.test(editArgs)) newNoAgent = true;
-    if (/--mode\s+agent|--agent/i.test(editArgs)) newNoAgent = false;
-
-    if (!newCron && !newPrompt && !newName) {
-      const tokens: string[] = [];
-      const regex = /"([^"]*)"|'([^']*)'|(\S+)/g;
+    // Parse flags if present (--cron, --prompt, --name, --tz, --mode)
+    const hasFlags = /--[a-zA-Z0-9_-]+/.test(editArgs);
+    if (hasFlags) {
+      const flagRegex = /--([a-zA-Z0-9_-]+)(?:\s+(?:"([^"]*)"|'([^']*)'|((?:(?! --).)+?))(?=\s+--|$))?/gs;
       let match: RegExpExecArray | null;
-      while ((match = regex.exec(editArgs)) !== null) {
-        const val = match[1] ?? match[2] ?? match[3];
-        if (val !== undefined && val.trim().length > 0) {
-          tokens.push(val.trim());
-        }
+      while ((match = flagRegex.exec(editArgs)) !== null) {
+        const key = match[1]!.toLowerCase();
+        const val = (match[2] ?? match[3] ?? match[4] ?? "true").trim();
+        if (key === "cron") newCron = val;
+        else if (key === "prompt") newPrompt = val;
+        else if (key === "name") newName = val;
+        else if (key === "tz" || key === "timezone") newTz = val;
+        else if (key === "mode") {
+          if (val.toLowerCase() === "script") newNoAgent = true;
+          if (val.toLowerCase() === "agent") newNoAgent = false;
+        } else if (key === "script") newNoAgent = true;
+        else if (key === "agent") newNoAgent = false;
       }
-
-      const isCronPart = (s: string) => s.split(" ").length >= 5 || s.includes("*") || s.startsWith("@");
-      const firstTok = tokens[0];
-      if (firstTok && isCronPart(firstTok)) {
-        newCron = firstTok;
-        if (tokens.length > 1) {
-          const firstQuoteEnd = editArgs.indexOf(firstTok) + firstTok.length;
-          newPrompt = editArgs.substring(firstQuoteEnd).replace(/^["'\s]+/, "").replace(/["'\s]+$/, "").trim();
+    } else {
+      // Positional edit arguments: test for quoted or unquoted cron
+      const parsedPositional = parseAddScheduleAndPrompt(editArgs);
+      if (parsedPositional) {
+        newCron = parsedPositional.cronExpression;
+        if (parsedPositional.prompt) {
+          newPrompt = parsedPositional.prompt;
         }
       } else {
-        newPrompt = editArgs.replace(/^["']|["']$/g, "").trim();
+        // If not a cron expression, treat entire editArgs as the new prompt
+        newPrompt = stripOuterQuotes(editArgs);
       }
     }
 
-    const res = cronScheduler.editJob(id, {
+    const res = cronScheduler.editJob(existingJob.id, {
       cronExpression: newCron,
       prompt: newPrompt,
       name: newName,
@@ -1096,13 +1177,24 @@ bot.command("cron", async (ctx) => {
     await ctx.reply(`⏳ Executing scheduled job <code>${escapeHtml(job.name || job.id)}</code> now...`, { parse_mode: "HTML" });
     try {
       await cronScheduler.executeJob(job.id, true);
+      await ctx.reply(`✅ Job <code>${escapeHtml(job.name || job.id)}</code> finished executing.`, { parse_mode: "HTML" });
     } catch (err: any) {
       console.error("Manual execution error:", err);
+      const safeErr = err.message && err.message.length > 2000 ? err.message.slice(0, 1950) + "\n...[truncated]" : (err.message || "Unknown error");
+      await ctx.reply(`❌ Manual execution failed for <code>${escapeHtml(job.name || job.id)}</code>:\n<pre>${escapeHtml(safeErr)}</pre>`, { parse_mode: "HTML" });
     }
     return;
   }
 
   if (["logs", "log", "history"].includes(sub)) {
+    if (rest) {
+      const specificJob = cronScheduler.getJob(rest);
+      if (!specificJob) {
+        await ctx.reply(`⚠️ Job <code>${escapeHtml(rest)}</code> not found.`, { parse_mode: "HTML" });
+        return;
+      }
+    }
+
     const jobLogs = cronScheduler.getLogs(rest || undefined, 5);
     if (jobLogs.length === 0 || jobLogs.every((j) => j.logs.length === 0)) {
       await ctx.reply("⏰ <b>No execution logs recorded yet.</b>\nLogs will appear after cron jobs execute.", {
@@ -1119,14 +1211,15 @@ bot.command("cron", async (ctx) => {
 
       for (const entry of logs.slice(-5).reverse()) {
         const timeStr = new Date(entry.runAt).toLocaleString("id-ID", {
-          timeZone: job.timezone || "Asia/Jakarta",
+          timeZone: job.timezone || config.defaultTimezone,
           dateStyle: "short",
           timeStyle: "medium",
         });
         const statusIcon = entry.status === "success" ? "✅" : "❌";
         const durationStr = `${(entry.durationMs / 1000).toFixed(2)}s`;
+        const runTag = entry.isManual ? " <i>(manual)</i>" : "";
 
-        msg += `  ${statusIcon} <code>${escapeHtml(timeStr)}</code> (${durationStr})\n`;
+        msg += `  ${statusIcon} <code>${escapeHtml(timeStr)}</code> (${durationStr})${runTag}\n`;
         if (entry.error) {
           msg += `     <i>Error:</i> <code>${escapeHtml(entry.error.slice(0, 80))}</code>\n`;
         } else if (entry.outputSnippet) {
@@ -1155,62 +1248,23 @@ bot.command("cron", async (ctx) => {
       return;
     }
 
-    // Parse tokens
-    const tokens: string[] = [];
-    const regex = /\"([^\"]*)\"|'([^']*)'|(\S+)/g;
-    let match: RegExpExecArray | null;
-    while ((match = regex.exec(cleanRest)) !== null) {
-      const val = match[1] ?? match[2] ?? match[3];
-      if (val !== undefined && val.trim().length > 0) {
-        tokens.push(val.trim());
-      }
-    }
-
-    const firstToken = tokens[0];
-    const secondToken = tokens[1];
-
-    if (!firstToken || !secondToken) {
+    const parsed = parseAddScheduleAndPrompt(cleanRest);
+    if (!parsed || !parsed.cronExpression || !parsed.prompt) {
       await ctx.reply(
-        '⚠️ Invalid format. Usage: <code>/cron add "&lt;cron_pattern&gt;" &lt;prompt&gt;</code>\nExample: <code>/cron add "0 8 * * *" Check battery and news</code>',
+        '⚠️ Invalid format. Usage:\n' +
+        '• <code>/cron add "&lt;cron&gt;" &lt;prompt&gt;</code>\n' +
+        '• <code>/cron add &lt;id&gt; "&lt;cron&gt;" &lt;prompt&gt;</code>\n' +
+        '• <code>/cron add 0 8 * * * &lt;prompt&gt;</code>\n' +
+        '• <code>/cron script "&lt;cron&gt;" &lt;command&gt;</code>',
         { parse_mode: "HTML" }
       );
       return;
     }
 
-    const isCronPart = (s: string) => s.split(" ").length >= 5 || s.includes("*") || s.startsWith("@");
-    let id: string | undefined;
-    let cronExpression: string;
-    let prompt: string;
-
-    if (isCronPart(firstToken)) {
-      cronExpression = firstToken;
-      const firstQuoteEnd = cleanRest.indexOf(firstToken) + firstToken.length;
-      prompt = cleanRest.substring(firstQuoteEnd).replace(/^[\"'\s]+/, "").replace(/[\"'\s]+$/, "").trim();
-      if (!prompt && tokens.length > 1) {
-        prompt = tokens.slice(1).join(" ");
-      }
-    } else if (tokens.length >= 3 && secondToken && isCronPart(secondToken)) {
-      id = firstToken;
-      cronExpression = secondToken;
-      const secondQuoteEnd = cleanRest.indexOf(secondToken) + secondToken.length;
-      prompt = cleanRest.substring(secondQuoteEnd).replace(/^[\"'\s]+/, "").replace(/[\"'\s]+$/, "").trim();
-      if (!prompt && tokens.length > 2) {
-        prompt = tokens.slice(2).join(" ");
-      }
-    } else {
-      cronExpression = firstToken;
-      prompt = tokens.slice(1).join(" ");
-    }
-
-    if (!prompt) {
-      await ctx.reply("⚠️ Please provide a prompt or command for the task to execute.", { parse_mode: "HTML" });
-      return;
-    }
-
     const result = cronScheduler.addJob({
-      id,
-      cronExpression,
-      prompt,
+      id: parsed.id,
+      cronExpression: parsed.cronExpression,
+      prompt: parsed.prompt,
       chatId,
       noAgent: isExplicitScript,
     });

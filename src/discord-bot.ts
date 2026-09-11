@@ -308,6 +308,14 @@ async function executeDiscordCommand(
 
     // 3. View Logs
     if (sub === "logs" || sub === "history") {
+      if (targetId) {
+        const specificJob = cronScheduler.getJob(targetId);
+        if (!specificJob) {
+          await reply(`⚠️ Job dengan ID \`${targetId}\` tidak ditemukan.`);
+          return true;
+        }
+      }
+
       const jobLogs = cronScheduler.getLogs(targetId || undefined, 5);
       if (jobLogs.length === 0 || jobLogs.every((j) => j.logs.length === 0)) {
         await reply("ℹ️ Belum ada catatan riwayat eksekusi cron.");
@@ -319,11 +327,14 @@ async function executeDiscordCommand(
         const mode = job.noAgent ? "⚡ Script" : "🧠 Agent";
         logMsg += `• **${job.name || job.id}** [${mode}] (\`${job.id}\`):\n`;
         for (const e of logs.slice(-5).reverse()) {
-          const time = new Date(e.runAt).toLocaleString("id-ID");
+          const time = new Date(e.runAt).toLocaleString("id-ID", {
+            timeZone: job.timezone || config.defaultTimezone,
+          });
           const icon = e.status === "success" ? "✅" : "❌";
           const dur = ((e.durationMs || 0) / 1000).toFixed(2) + "s";
+          const runTag = e.isManual ? " *(manual)*" : "";
           const preview = (e.outputSnippet || e.error || "Done").replace(/\n+/g, " ").slice(0, 60);
-          logMsg += `  ${icon} ${time} (${dur}) -> ${preview}\n`;
+          logMsg += `  ${icon} ${time} (${dur})${runTag} -> ${preview}\n`;
         }
         logMsg += "\n";
       }
@@ -344,9 +355,12 @@ async function executeDiscordCommand(
         const status = job.enabled ? "✅ Active" : "⏸️ Paused";
         report += `• **${job.name || job.id}** [${mode}] — ${status}\n`;
         report += `  • **ID:** \`${job.id}\`\n`;
-        report += `  • **Schedule:** \`${job.cronExpression}\` | Timezone: \`${job.timezone || "Default"}\`\n`;
+        report += `  • **Schedule:** \`${job.cronExpression}\` | Timezone: \`${job.timezone || config.defaultTimezone}\`\n`;
+        report += `  • **Next Run:** \`${job.nextRun || "N/A"}\`\n`;
         if (job.lastRun) {
-          const timeStr = new Date(job.lastRun).toLocaleString("id-ID");
+          const timeStr = new Date(job.lastRun).toLocaleString("id-ID", {
+            timeZone: job.timezone || config.defaultTimezone,
+          });
           report += `  • **Last Run:** ${job.lastStatus === "success" ? "✅" : "❌"} ${timeStr} (${((job.lastDurationMs || 0) / 1000).toFixed(2)}s)\n`;
         }
         report += "\n";

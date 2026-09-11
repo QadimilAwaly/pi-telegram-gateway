@@ -16,6 +16,7 @@ export interface GatewayConfig {
   defaultProvider?: string;
   defaultModel?: string;
   defaultThinkingLevel?: "off" | "low" | "medium" | "high";
+  defaultTimezone: string;
 }
 
 function parseAllowedUsers(raw?: string): number[] {
@@ -43,4 +44,5 @@ export const config: GatewayConfig = {
   defaultProvider: process.env.DEFAULT_PROVIDER,
   defaultModel: process.env.DEFAULT_MODEL,
   defaultThinkingLevel: (process.env.DEFAULT_THINKING_LEVEL as any) || undefined,
+  defaultTimezone: process.env.DEFAULT_TIMEZONE || process.env.TZ || "Asia/Makassar",
 };

@@ -76,7 +76,7 @@ export class SessionPool {
     return dir;
   }
 
-  private applyConfiguredDefaults(session: AgentSession) {
+  public applyConfiguredDefaults(session: AgentSession) {
     if (!this.services?.modelRuntime) return;
 
     if (config.defaultModel) {

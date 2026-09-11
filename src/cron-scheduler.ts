@@ -19,6 +19,7 @@ export interface CronRunLog {
   error?: string;
   outputSnippet?: string;
   isNoAgent?: boolean;
+  isManual?: boolean;
 }
 
 export interface CronJobConfig {
@@ -38,15 +39,30 @@ export interface CronJobConfig {
   history?: CronRunLog[];
 }
 
+export function isValidCronExpression(expr: string, timezone?: string): boolean {
+  if (!expr || typeof expr !== "string") return false;
+  try {
+    const test = new Cron(expr.trim(), { timezone: timezone || config.defaultTimezone });
+    test.stop();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export class CronScheduler {
   private jobs = new Map<string, CronJobConfig>();
   private cronInstances = new Map<string, Cron>();
   private runningJobs = new Set<string>();
+  private activeAgentSessions = new Map<string, AgentSession>();
+  private activeProcesses = new Map<string, any>();
   private bot: Bot | null = null;
   private storageFile: string;
+  private backupFile: string;
   private defaultTimezone: string;
   private fileWatcher: fs.FSWatcher | null = null;
   private isSaving = false;
+  private lastSaveTimeMs = 0;
 
   private discordSender: ((title: string, rawText: string) => Promise<void>) | null = null;
 
@@ -56,10 +72,8 @@ export class CronScheduler {
 
   constructor() {
     this.storageFile = path.join(config.sessionsDir, "cron-jobs.json");
-    const sysTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-    this.defaultTimezone =
-      process.env.TZ ||
-      (sysTz && sysTz !== "UTC" ? sysTz : "Asia/Jakarta");
+    this.backupFile = path.join(config.sessionsDir, "cron-jobs.json.bak");
+    this.defaultTimezone = config.defaultTimezone || process.env.TZ || "Asia/Makassar";
   }
 
   init(bot?: Bot | null) {
@@ -77,13 +91,45 @@ export class CronScheduler {
       } catch {}
       this.fileWatcher = null;
     }
+
     for (const [, instance] of this.cronInstances) {
       try {
         instance.stop();
       } catch {}
     }
     this.cronInstances.clear();
+
+    // Gracefully terminate active background agent sessions
+    for (const [, session] of this.activeAgentSessions) {
+      try {
+        session.abort().catch(() => {});
+        session.dispose();
+      } catch {}
+    }
+    this.activeAgentSessions.clear();
+
+    // Terminate spawned script processes
+    for (const [, proc] of this.activeProcesses) {
+      try {
+        proc.kill(9);
+      } catch {}
+    }
+    this.activeProcesses.clear();
     this.runningJobs.clear();
+  }
+
+  /**
+   * Safe, case-insensitive lookup helper for job IDs
+   */
+  private findJobEntry(id: string): [string, CronJobConfig] | [undefined, undefined] {
+    if (!id) return [undefined, undefined];
+    const normalized = id.toLowerCase().trim();
+    for (const [key, job] of this.jobs) {
+      if (key.toLowerCase() === normalized || (job.id && job.id.toLowerCase() === normalized)) {
+        return [key, job];
+      }
+    }
+    return [undefined, undefined];
   }
 
   private startWatcher() {
@@ -94,15 +140,17 @@ export class CronScheduler {
       }
       let debounceTimer: any = null;
       this.fileWatcher = fs.watch(config.sessionsDir, (eventType, filename) => {
+        // Only react strictly to changes on cron-jobs.json
+        if (filename !== "cron-jobs.json") return;
         if (this.isSaving) return;
-        if (filename === "cron-jobs.json" || !filename) {
-          if (debounceTimer) clearTimeout(debounceTimer);
-          debounceTimer = setTimeout(() => {
-            console.log("⏰ [CronScheduler] Detected external change in cron-jobs.json. Auto-syncing...");
-            this.loadJobs();
-            this.scheduleAll();
-          }, 300);
-        }
+        if (Date.now() - this.lastSaveTimeMs < 1500) return;
+
+        if (debounceTimer) clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => {
+          console.log("⏰ [CronScheduler] Detected external change in cron-jobs.json. Auto-syncing...");
+          this.loadJobs();
+          this.scheduleAll();
+        }, 300);
       });
       this.fileWatcher.on("error", (err: any) => {
         console.error("Cron file watcher error:", err.message);
@@ -123,13 +171,26 @@ export class CronScheduler {
       if (!fs.existsSync(config.sessionsDir)) {
         fs.mkdirSync(config.sessionsDir, { recursive: true });
       }
-      if (fs.existsSync(this.storageFile)) {
-        const raw = fs.readFileSync(this.storageFile, "utf-8");
-        const list: CronJobConfig[] = JSON.parse(raw);
-        this.jobs.clear();
-        for (const item of list) {
-          if (!item.history) item.history = [];
-          this.jobs.set(item.id, item);
+
+      let targetFileToRead = this.storageFile;
+      if (!fs.existsSync(this.storageFile) && fs.existsSync(this.backupFile)) {
+        console.warn("⚠️ cron-jobs.json not found, restoring from backup...");
+        targetFileToRead = this.backupFile;
+      }
+
+      if (fs.existsSync(targetFileToRead)) {
+        const raw = fs.readFileSync(targetFileToRead, "utf-8");
+        if (raw.trim()) {
+          const list: CronJobConfig[] = JSON.parse(raw);
+          this.jobs.clear();
+          for (const item of list) {
+            if (!item.history) item.history = [];
+            this.jobs.set(item.id, item);
+          }
+          // Maintain a backup copy of valid loaded jobs
+          try {
+            fs.copyFileSync(targetFileToRead, this.backupFile);
+          } catch {}
         }
       }
     } catch (err) {
@@ -140,6 +201,8 @@ export class CronScheduler {
   private saveJobs(mergeWithDisk: boolean = true) {
     try {
       this.isSaving = true;
+      this.lastSaveTimeMs = Date.now();
+
       if (mergeWithDisk) {
         let diskJobs: CronJobConfig[] = [];
         if (fs.existsSync(this.storageFile)) {
@@ -159,7 +222,17 @@ export class CronScheduler {
       }
 
       const list = Array.from(this.jobs.values());
-      fs.writeFileSync(this.storageFile, JSON.stringify(list, null, 2), "utf-8");
+      const jsonContent = JSON.stringify(list, null, 2);
+
+      // Atomic write: write to temp file then renameSync
+      const tmpFile = `${this.storageFile}.${Date.now()}.tmp`;
+      fs.writeFileSync(tmpFile, jsonContent, "utf-8");
+      fs.renameSync(tmpFile, this.storageFile);
+
+      // Save backup copy
+      try {
+        fs.writeFileSync(this.backupFile, jsonContent, "utf-8");
+      } catch {}
     } catch (err) {
       console.error("Failed to save cron-jobs.json:", err);
     } finally {
@@ -198,7 +271,7 @@ export class CronScheduler {
           },
         },
         async () => {
-          await this.executeJob(job.id);
+          await this.executeJob(job.id, false);
         }
       );
 
@@ -209,20 +282,23 @@ export class CronScheduler {
   }
 
   getNextRun(id: string): string | null {
-    const instance = this.cronInstances.get(id);
+    const [, job] = this.findJobEntry(id);
+    if (!job) return null;
+    const instance = this.cronInstances.get(job.id);
     if (!instance) return null;
     const nextDate = instance.nextRun();
     if (!nextDate) return null;
     return nextDate.toLocaleString("id-ID", {
-      timeZone: this.jobs.get(id)?.timezone || this.defaultTimezone,
+      timeZone: job.timezone || this.defaultTimezone,
       dateStyle: "short",
       timeStyle: "short",
     });
   }
 
+  /**
+   * Pure in-memory query to avoid timer churn and unwanted I/O
+   */
   listJobs(): Array<CronJobConfig & { nextRun?: string | null }> {
-    this.loadJobs();
-    this.scheduleAll();
     return Array.from(this.jobs.values()).map((j) => ({
       ...j,
       nextRun: j.enabled ? this.getNextRun(j.id) : "Paused",
@@ -230,13 +306,12 @@ export class CronScheduler {
   }
 
   getJob(id: string): CronJobConfig | undefined {
-    this.loadJobs();
-    return this.jobs.get(id);
+    return this.findJobEntry(id)[1];
   }
 
   getLogs(id?: string, limit: number = 5): Array<{ job: CronJobConfig; logs: CronRunLog[] }> {
     if (id) {
-      const job = this.jobs.get(id);
+      const [, job] = this.findJobEntry(id);
       if (!job) return [];
       return [{ job, logs: (job.history || []).slice(-limit) }];
     }
@@ -255,6 +330,7 @@ export class CronScheduler {
       error?: string;
       outputSnippet?: string;
       isNoAgent?: boolean;
+      isManual?: boolean;
     }
   ) {
     if (!job.history) job.history = [];
@@ -286,12 +362,22 @@ export class CronScheduler {
     timezone?: string;
   }): { ok: boolean; job?: CronJobConfig; error?: string } {
     try {
-      new Cron(options.cronExpression, { timezone: options.timezone || this.defaultTimezone });
+      const testCron = new Cron(options.cronExpression, { timezone: options.timezone || this.defaultTimezone });
+      testCron.stop();
     } catch (err: any) {
       return { ok: false, error: `Invalid cron expression: ${err.message}` };
     }
 
     const id = (options.id || `job_${Date.now().toString(36)}`).toLowerCase().replace(/[^a-z0-9_-]/g, "_");
+
+    // Prevent accidental overwrite of existing job
+    const existing = this.findJobEntry(id)[1];
+    if (existing) {
+      return {
+        ok: false,
+        error: `Job with ID '${id}' already exists. Use '/cron edit ${id}' to modify it or specify a different ID.`,
+      };
+    }
 
     const job: CronJobConfig = {
       id,
@@ -324,8 +410,7 @@ export class CronScheduler {
       enabled?: boolean;
     }
   ): { ok: boolean; job?: CronJobConfig; error?: string; changes?: string[] } {
-    this.loadJobs();
-    const job = this.jobs.get(id);
+    const [, job] = this.findJobEntry(id);
     if (!job) {
       return { ok: false, error: `Job with ID '${id}' not found.` };
     }
@@ -391,12 +476,15 @@ export class CronScheduler {
   }
 
   removeJob(id: string): boolean {
-    const instance = this.cronInstances.get(id);
+    const [key, job] = this.findJobEntry(id);
+    if (!key || !job) return false;
+
+    const instance = this.cronInstances.get(job.id);
     if (instance) {
       instance.stop();
-      this.cronInstances.delete(id);
+      this.cronInstances.delete(job.id);
     }
-    const existed = this.jobs.delete(id);
+    const existed = this.jobs.delete(key);
     if (existed) {
       this.saveJobs(false);
     }
@@ -404,20 +492,20 @@ export class CronScheduler {
   }
 
   pauseJob(id: string): boolean {
-    const job = this.jobs.get(id);
+    const [, job] = this.findJobEntry(id);
     if (!job) return false;
     job.enabled = false;
-    const instance = this.cronInstances.get(id);
+    const instance = this.cronInstances.get(job.id);
     if (instance) {
       instance.stop();
-      this.cronInstances.delete(id);
+      this.cronInstances.delete(job.id);
     }
     this.saveJobs();
     return true;
   }
 
   resumeJob(id: string): boolean {
-    const job = this.jobs.get(id);
+    const [, job] = this.findJobEntry(id);
     if (!job) return false;
     job.enabled = true;
     this.saveJobs();
@@ -426,35 +514,38 @@ export class CronScheduler {
   }
 
   async executeJob(id: string, manual: boolean = false): Promise<string> {
-    const job = this.jobs.get(id);
-    if (!job) throw new Error(`Job ${id} not found`);
+    const [, job] = this.findJobEntry(id);
+    if (!job) throw new Error(`Job '${id}' not found`);
 
-    if (this.runningJobs.has(id)) {
-      console.log(`⏰ [Cron] Job "${id}" is already executing, skipping overlapping run.`);
+    if (this.runningJobs.has(job.id)) {
+      console.log(`⏰ [Cron] Job "${job.id}" is already executing, skipping overlapping run.`);
       return "";
     }
 
-    this.runningJobs.add(id);
+    this.runningJobs.add(job.id);
     const startTime = Date.now();
     const modeTag = job.noAgent ? "⚡ Direct Script" : "🤖 Agent Reasoning";
-    console.log(`⏰ [Cron] Executing job "${job.name || job.id}" (${job.cronExpression}) [${modeTag}]...`);
+    const runType = manual ? " [Manual Trigger]" : "";
+    console.log(`⏰ [Cron] Executing job "${job.name || job.id}" (${job.cronExpression}) [${modeTag}]${runType}...`);
 
     // =========================================================================
     // BRANCH A: NO_AGENT = TRUE (Pure Script / Bash Execution, 0 LLM Tokens)
     // =========================================================================
     if (job.noAgent) {
+      let proc: any = null;
       try {
-        const proc = Bun.spawn(["bash", "-c", job.prompt], {
+        proc = Bun.spawn(["bash", "-c", job.prompt], {
           cwd: config.defaultCwd,
           stdout: "pipe",
           stderr: "pipe",
         });
+        this.activeProcesses.set(job.id, proc);
 
         const timeoutMs = 120_000;
         let timeoutTimer: any = null;
         const timeoutPromise = new Promise<never>((_, reject) => {
           timeoutTimer = setTimeout(() => {
-            try { proc.kill(); } catch {}
+            try { proc.kill(9); } catch {}
             reject(new Error(`Script execution timed out after ${timeoutMs / 1000}s`));
           }, timeoutMs);
         });
@@ -482,12 +573,26 @@ export class CronScheduler {
             error: errMsg,
             outputSnippet: output.slice(0, 150),
             isNoAgent: true,
+            isManual: manual,
           });
 
+          // Safe error truncation to avoid Telegram 4096 character limits
+          const safeErrDisplay = errMsg.length > 2500 ? errMsg.slice(0, 2450) + "\n...[truncated]" : errMsg;
+
           if (this.bot && job.chatId) {
-            const errorMsg = `⚠️ <b>[Scheduled Script Error]</b> <b>${escapeHtml(job.name || job.id)}</b> (⚡ Direct Script)\n⏱️ <i>Duration: ${(durationMs / 1000).toFixed(2)}s</i>\n\n<pre>${escapeHtml(errMsg)}</pre>`;
+            const errorMsg = `⚠️ <b>[Scheduled Script Error]</b> <b>${escapeHtml(job.name || job.id)}</b> (⚡ Direct Script)\n⏱️ <i>Duration: ${(durationMs / 1000).toFixed(2)}s</i>\n\n<pre>${escapeHtml(safeErrDisplay)}</pre>`;
             await this.bot.api.sendMessage(job.chatId, errorMsg, { parse_mode: "HTML" }).catch(() => {});
           }
+
+          if (this.discordSender) {
+            try {
+              const title = `⚠️ **[Scheduled Script Error]** **${job.name || job.id}** (⚡ Direct Script)\n⏱️ *Duration: ${(durationMs / 1000).toFixed(2)}s*\n\n`;
+              await this.discordSender(title, `\`\`\`text\n${safeErrDisplay.slice(0, 1800)}\n\`\`\``);
+            } catch (dErr: any) {
+              console.error("❌ [Cron Discord] Error broadcasting script error:", dErr.message);
+            }
+          }
+
           throw new Error(errMsg);
         }
 
@@ -496,22 +601,28 @@ export class CronScheduler {
           status: "success",
           outputSnippet: output.slice(0, 150),
           isNoAgent: true,
+          isManual: manual,
         });
 
         if (this.bot && job.chatId) {
           const timeStr = new Date().toLocaleString("id-ID", {
             timeZone: job.timezone || this.defaultTimezone,
           });
-          const title = `⏰ <b>[Scheduled Task]</b> <b>${escapeHtml(job.name || job.id)}</b> (⚡ Direct Script)\n📅 <i>${escapeHtml(timeStr)}</i> | ⏱️ <i>${(durationMs / 1000).toFixed(2)}s</i>\n\n`;
+          const triggerNote = manual ? " <i>[Manual Run]</i>" : "";
+          const title = `⏰ <b>[Scheduled Task]</b> <b>${escapeHtml(job.name || job.id)}</b> (⚡ Direct Script)${triggerNote}\n📅 <i>${escapeHtml(timeStr)}</i> | ⏱️ <i>${(durationMs / 1000).toFixed(2)}s</i>\n\n`;
           const htmlBody = markdownToTelegramHtml(output);
           const totalMessage = title + htmlBody;
           const chunks = splitMessage(totalMessage);
 
-          for (const chunk of chunks) {
+          for (let i = 0; i < chunks.length; i++) {
+            const chunk = chunks[i]!;
             try {
               await this.bot.api.sendMessage(job.chatId, chunk, { parse_mode: "HTML" });
             } catch {
               await this.bot.api.sendMessage(job.chatId, chunk.replace(/<[^>]*>/g, ""));
+            }
+            if (i < chunks.length - 1) {
+              await new Promise((r) => setTimeout(r, 250));
             }
           }
         }
@@ -521,7 +632,8 @@ export class CronScheduler {
             const timeStr = new Date().toLocaleString("id-ID", {
               timeZone: job.timezone || this.defaultTimezone,
             });
-            const title = `⏰ **[Scheduled Task]** **${job.name || job.id}** (⚡ Direct Script)\n📅 *${timeStr}* | ⏱️ *${(durationMs / 1000).toFixed(2)}s*\n\n`;
+            const triggerNote = manual ? " *[Manual Run]*" : "";
+            const title = `⏰ **[Scheduled Task]** **${job.name || job.id}** (⚡ Direct Script)${triggerNote}\n📅 *${timeStr}* | ⏱️ *${(durationMs / 1000).toFixed(2)}s*\n\n`;
             await this.discordSender(title, output);
           } catch (err: any) {
             console.error("❌ [Cron Discord] Error sending direct script output:", err.message);
@@ -533,7 +645,8 @@ export class CronScheduler {
         console.error(`❌ [Cron No-Agent] Error running job ${job.id}:`, err.message);
         throw err;
       } finally {
-        this.runningJobs.delete(id);
+        if (proc) this.activeProcesses.delete(job.id);
+        this.runningJobs.delete(job.id);
       }
     }
 
@@ -542,7 +655,7 @@ export class CronScheduler {
     // =========================================================================
     const services = sessionPool.getServices();
     if (!services) {
-      this.runningJobs.delete(id);
+      this.runningJobs.delete(job.id);
       throw new Error("Session pool services not initialized yet");
     }
 
@@ -558,28 +671,13 @@ export class CronScheduler {
         sessionManager: SessionManager.create(config.defaultCwd, cronSessionDir),
       });
       session = res.session;
+      this.activeAgentSessions.set(job.id, session);
+
+      // Apply consistent configured model defaults
+      sessionPool.applyConfiguredDefaults(session);
 
       let fullResponse = "";
       let modelErrorMessage: string | null = null;
-
-      if (config.defaultModel && services.modelRuntime) {
-        const runtime = services.modelRuntime;
-        let targetModel: Model | undefined;
-        if (config.defaultProvider) {
-          targetModel = runtime.getModel(config.defaultProvider, config.defaultModel);
-        } else {
-          const parts = config.defaultModel.split("/");
-          if (parts.length === 2) {
-            targetModel = runtime.getModel(parts[0], parts[1]);
-          }
-        }
-        if (targetModel) {
-          await session.setModel(targetModel);
-        }
-      }
-      if (config.defaultThinkingLevel) {
-        session.setThinkingLevel(config.defaultThinkingLevel);
-      }
 
       const unsubscribe = session.subscribe((event) => {
         if (event.type === "message_update") {
@@ -640,22 +738,28 @@ export class CronScheduler {
         status: "success",
         outputSnippet: fullResponse.slice(0, 150),
         isNoAgent: false,
+        isManual: manual,
       });
 
       if (this.bot && job.chatId) {
         const timeStr = new Date().toLocaleString("id-ID", {
           timeZone: job.timezone || this.defaultTimezone,
         });
-        const title = `⏰ <b>[Scheduled Task]</b> <b>${escapeHtml(job.name || job.id)}</b> (🤖 Agent)\n📅 <i>${escapeHtml(timeStr)}</i> | ⏱️ <i>${(durationMs / 1000).toFixed(2)}s</i>\n\n`;
+        const triggerNote = manual ? " <i>[Manual Run]</i>" : "";
+        const title = `⏰ <b>[Scheduled Task]</b> <b>${escapeHtml(job.name || job.id)}</b> (🤖 Agent)${triggerNote}\n📅 <i>${escapeHtml(timeStr)}</i> | ⏱️ <i>${(durationMs / 1000).toFixed(2)}s</i>\n\n`;
         const htmlBody = markdownToTelegramHtml(fullResponse);
         const totalMessage = title + htmlBody;
         const chunks = splitMessage(totalMessage);
 
-        for (const chunk of chunks) {
+        for (let i = 0; i < chunks.length; i++) {
+          const chunk = chunks[i]!;
           try {
             await this.bot.api.sendMessage(job.chatId, chunk, { parse_mode: "HTML" });
           } catch {
             await this.bot.api.sendMessage(job.chatId, chunk.replace(/<[^>]*>/g, ""));
+          }
+          if (i < chunks.length - 1) {
+            await new Promise((r) => setTimeout(r, 250));
           }
         }
       }
@@ -665,7 +769,8 @@ export class CronScheduler {
           const timeStr = new Date().toLocaleString("id-ID", {
             timeZone: job.timezone || this.defaultTimezone,
           });
-          const title = `⏰ **[Scheduled Task]** **${job.name || job.id}** (🧠 Agent)\n📅 *${timeStr}* | ⏱️ *${(durationMs / 1000).toFixed(2)}s*\n\n`;
+          const triggerNote = manual ? " *[Manual Run]*" : "";
+          const title = `⏰ **[Scheduled Task]** **${job.name || job.id}** (🧠 Agent)${triggerNote}\n📅 *${timeStr}* | ⏱️ *${(durationMs / 1000).toFixed(2)}s*\n\n`;
           await this.discordSender(title, fullResponse);
         } catch (err: any) {
           console.error("❌ [Cron Discord] Error sending agent output:", err.message);
@@ -682,16 +787,29 @@ export class CronScheduler {
         status: "error",
         error: err.message,
         isNoAgent: false,
+        isManual: manual,
       });
 
+      const safeErrDisplay = err.message && err.message.length > 2500 ? err.message.slice(0, 2450) + "\n...[truncated]" : (err.message || "Unknown error");
+
       if (this.bot && job.chatId) {
-        const errorMsg = `⚠️ <b>[Scheduled Task Error]</b> <b>${escapeHtml(job.name || job.id)}</b> (🤖 Agent)\n⏱️ <i>Duration: ${(durationMs / 1000).toFixed(2)}s</i>\n\n<pre>${escapeHtml(err.message)}</pre>`;
+        const errorMsg = `⚠️ <b>[Scheduled Task Error]</b> <b>${escapeHtml(job.name || job.id)}</b> (🤖 Agent)\n⏱️ <i>Duration: ${(durationMs / 1000).toFixed(2)}s</i>\n\n<pre>${escapeHtml(safeErrDisplay)}</pre>`;
         await this.bot.api.sendMessage(job.chatId, errorMsg, { parse_mode: "HTML" }).catch(() => {});
+      }
+
+      if (this.discordSender) {
+        try {
+          const title = `⚠️ **[Scheduled Task Error]** **${job.name || job.id}** (🧠 Agent)\n⏱️ *Duration: ${(durationMs / 1000).toFixed(2)}s*\n\n`;
+          await this.discordSender(title, `\`\`\`text\n${safeErrDisplay.slice(0, 1800)}\n\`\`\``);
+        } catch (dErr: any) {
+          console.error("❌ [Cron Discord] Error broadcasting agent error:", dErr.message);
+        }
       }
 
       throw err;
     } finally {
-      this.runningJobs.delete(id);
+      this.activeAgentSessions.delete(job.id);
+      this.runningJobs.delete(job.id);
       if (session) {
         try {
           session.dispose();
