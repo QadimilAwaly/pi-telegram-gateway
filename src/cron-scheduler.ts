@@ -59,6 +59,8 @@ export class CronScheduler {
   private bot: Bot | null = null;
   private storageFile: string;
   private backupFile: string;
+  private tombstoneFile: string;
+  private tombstones = new Set<string>();
   private defaultTimezone: string;
   private fileWatcher: fs.FSWatcher | null = null;
   private isSaving = false;
@@ -73,6 +75,7 @@ export class CronScheduler {
   constructor() {
     this.storageFile = path.join(config.sessionsDir, "cron-jobs.json");
     this.backupFile = path.join(config.sessionsDir, "cron-jobs.json.bak");
+    this.tombstoneFile = path.join(config.sessionsDir, "cron-tombstones.json");
     this.defaultTimezone = config.defaultTimezone || process.env.TZ || "Asia/Makassar";
   }
 
@@ -166,11 +169,38 @@ export class CronScheduler {
     console.log(`⏰ CronScheduler reloaded from disk. Total jobs: ${this.jobs.size}`);
   }
 
+  private loadTombstones() {
+    try {
+      if (fs.existsSync(this.tombstoneFile)) {
+        const raw = fs.readFileSync(this.tombstoneFile, "utf-8");
+        if (raw.trim()) {
+          const arr: string[] = JSON.parse(raw);
+          this.tombstones = new Set(arr.map((s) => String(s).toLowerCase().trim()));
+        }
+      }
+    } catch (err) {
+      console.error("Failed to load cron-tombstones.json:", err);
+    }
+  }
+
+  private saveTombstones() {
+    try {
+      const arr = Array.from(this.tombstones);
+      const tmp = `${this.tombstoneFile}.${Date.now()}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(arr, null, 2), "utf-8");
+      fs.renameSync(tmp, this.tombstoneFile);
+    } catch (err) {
+      console.error("Failed to save cron-tombstones.json:", err);
+    }
+  }
+
   private loadJobs() {
     try {
       if (!fs.existsSync(config.sessionsDir)) {
         fs.mkdirSync(config.sessionsDir, { recursive: true });
       }
+
+      this.loadTombstones();
 
       let targetFileToRead = this.storageFile;
       if (!fs.existsSync(this.storageFile) && fs.existsSync(this.backupFile)) {
@@ -184,12 +214,16 @@ export class CronScheduler {
           const list: CronJobConfig[] = JSON.parse(raw);
           this.jobs.clear();
           for (const item of list) {
+            if (this.tombstones.has(item.id.toLowerCase())) {
+              continue; // Prevent resurrection of deleted job
+            }
             if (!item.history) item.history = [];
             this.jobs.set(item.id, item);
           }
           // Maintain a backup copy of valid loaded jobs
           try {
-            fs.copyFileSync(targetFileToRead, this.backupFile);
+            const cleanList = Array.from(this.jobs.values());
+            fs.writeFileSync(this.backupFile, JSON.stringify(cleanList, null, 2), "utf-8");
           } catch {}
         }
       }
@@ -198,7 +232,7 @@ export class CronScheduler {
     }
   }
 
-  private saveJobs(mergeWithDisk: boolean = true) {
+  private saveJobs(mergeWithDisk: boolean = false) {
     try {
       this.isSaving = true;
       this.lastSaveTimeMs = Date.now();
@@ -213,10 +247,14 @@ export class CronScheduler {
 
         const merged = new Map<string, CronJobConfig>();
         for (const dj of diskJobs) {
-          merged.set(dj.id, dj);
+          if (!this.tombstones.has(dj.id.toLowerCase())) {
+            merged.set(dj.id, dj);
+          }
         }
         for (const [id, memJob] of this.jobs) {
-          merged.set(id, memJob);
+          if (!this.tombstones.has(id.toLowerCase())) {
+            merged.set(id, memJob);
+          }
         }
         this.jobs = merged;
       }
@@ -379,6 +417,12 @@ export class CronScheduler {
       };
     }
 
+    // Clear any tombstone if re-creating
+    if (this.tombstones.has(id.toLowerCase())) {
+      this.tombstones.delete(id.toLowerCase());
+      this.saveTombstones();
+    }
+
     const job: CronJobConfig = {
       id,
       name: options.name || options.prompt.slice(0, 30),
@@ -478,6 +522,11 @@ export class CronScheduler {
   removeJob(id: string): boolean {
     const [key, job] = this.findJobEntry(id);
     if (!key || !job) return false;
+
+    // Track tombstone to prevent resurrection from disk or backup
+    this.tombstones.add(job.id.toLowerCase());
+    this.tombstones.add(key.toLowerCase());
+    this.saveTombstones();
 
     const instance = this.cronInstances.get(job.id);
     if (instance) {

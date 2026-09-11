@@ -35,10 +35,48 @@ interface ActiveSessionEntry {
   aborted?: boolean;
 }
 
+/**
+ * Asynchronous keyed mutex to serialize concurrent operations per key (e.g. per chatId)
+ * and prevent race conditions during session archiving and restoration.
+ */
+export class KeyedMutex {
+  private locks = new Map<string | number, Promise<void>>();
+
+  async runExclusive<T>(key: string | number, task: () => Promise<T> | T): Promise<T> {
+    const prev = this.locks.get(key) || Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    this.locks.set(key, current);
+
+    try {
+      await prev;
+    } catch {
+      // Previous failure should not prevent subsequent tasks from running
+    }
+
+    try {
+      return await task();
+    } finally {
+      release();
+      if (this.locks.get(key) === current) {
+        this.locks.delete(key);
+      }
+    }
+  }
+
+  isLocked(key: string | number): boolean {
+    return this.locks.has(key);
+  }
+}
+
 export class SessionPool {
   private sessions = new Map<string | number, ActiveSessionEntry>();
   private services: any = null;
   private cleanupInterval: any = null;
+  private archiveMutex = new KeyedMutex();
 
   async init() {
     if (!fs.existsSync(config.sessionsDir)) {
@@ -166,14 +204,37 @@ export class SessionPool {
 
     this.sessions.set(chatId, entry);
 
-    // Soft-archive older sessions in background with Gzip compression & Mnemosyne extraction
-    sessionArchiver.archiveInactiveSessions(chatId, {
+    // Soft-archive older sessions in background with Gzip compression & Mnemosyne extraction (serialized via mutex)
+    this.archiveSessions(chatId, {
       keepLatest: 1,
       exportMarkdown: true,
       activeSessionFile: session.sessionFile,
     }).catch((err) => console.error("Auto-archival error on reset:", err));
 
     return session;
+  }
+
+  /**
+   * Archive inactive sessions with mutex lock per chat to prevent race conditions
+   */
+  async archiveSessions(
+    chatId: string | number,
+    options: {
+      keepLatest?: number;
+      exportMarkdown?: boolean;
+      activeSessionFile?: string;
+    } = {}
+  ): Promise<{ archivedCount: number; savedBytes: number; reports: string[] }> {
+    return this.archiveMutex.runExclusive(chatId, async () => {
+      return await sessionArchiver.archiveInactiveSessions(chatId, options);
+    });
+  }
+
+  /**
+   * Check whether an archival operation is currently in progress for a chat
+   */
+  isArchiving(chatId: string | number): boolean {
+    return this.archiveMutex.isLocked(chatId);
   }
 
   async listSessions(chatId: string | number): Promise<SessionInfo[]> {
@@ -321,9 +382,11 @@ export class SessionPool {
 
     let targetFilePath = matchedSession.filePath;
 
-    // If it's archived (.gz), restore/decompress it first
+    // If it's archived (.gz), restore/decompress it first (protected by archiveMutex to prevent race conditions)
     if (matchedSession.isArchived) {
-      const restoreRes = sessionArchiver.restoreSession(chatId, matchedSession.id);
+      const restoreRes = await this.archiveMutex.runExclusive(chatId, () => {
+        return sessionArchiver.restoreSession(chatId, matchedSession.id);
+      });
       if (!restoreRes.ok || !restoreRes.restoredFile) {
         throw new Error(`Failed to restore archived session: ${restoreRes.error || "Unknown error"}`);
       }

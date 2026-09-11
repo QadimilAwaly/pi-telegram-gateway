@@ -2,8 +2,23 @@ import dotenv from "dotenv";
 import path from "path";
 import os from "os";
 
-// Load .env from current directory or gateway root
-dotenv.config();
+const defaultHome = os.homedir();
+
+function resolvePath(p?: string, fallback: string = ""): string {
+  if (!p || !p.trim()) return fallback;
+  const trimmed = p.trim();
+  if (trimmed.startsWith("~/")) {
+    return path.resolve(defaultHome, trimmed.slice(2));
+  }
+  return path.resolve(trimmed);
+}
+
+// Explicitly load .env from gateway root with override: true so .env takes precedence over ambient/stale shell env
+const projectRoot = path.resolve(import.meta.dir, "..");
+dotenv.config({
+  path: path.join(projectRoot, ".env"),
+  override: true,
+});
 
 export interface GatewayConfig {
   mode: "dual" | "telegram" | "discord";
@@ -27,7 +42,11 @@ function parseAllowedUsers(raw?: string): number[] {
     .filter((n) => !isNaN(n));
 }
 
-const defaultHome = os.homedir();
+const defaultCwd = resolvePath(process.env.DEFAULT_CWD, defaultHome);
+const sessionsDir = resolvePath(
+  process.env.SESSIONS_DIR,
+  path.join(defaultHome, ".pi", "telegram-sessions")
+);
 
 export const config: GatewayConfig = {
   mode: (process.env.GATEWAY_MODE as any) || "dual",
@@ -38,11 +57,11 @@ export const config: GatewayConfig = {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean),
-  defaultCwd: process.env.DEFAULT_CWD || defaultHome,
-  sessionsDir:
-    process.env.SESSIONS_DIR || path.join(defaultHome, ".pi", "telegram-sessions"),
+  defaultCwd,
+  sessionsDir,
   defaultProvider: process.env.DEFAULT_PROVIDER,
   defaultModel: process.env.DEFAULT_MODEL,
   defaultThinkingLevel: (process.env.DEFAULT_THINKING_LEVEL as any) || undefined,
   defaultTimezone: process.env.DEFAULT_TIMEZONE || process.env.TZ || "Asia/Makassar",
 };
+

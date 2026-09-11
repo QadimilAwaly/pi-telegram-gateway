@@ -204,4 +204,49 @@ describe("Cron Scheduler Engine", () => {
     const jobs2 = scheduler.listJobs();
     expect(jobs2[0]?.nextRun).toBe(jobs1[0]?.nextRun);
   });
+  test("prevents resurrection of deleted jobs via tombstones", () => {
+    scheduler.addJob({
+      id: "zombie_candidate",
+      cronExpression: "0 8 * * *",
+      prompt: "test zombie",
+      chatId: 12345,
+    });
+
+    expect(scheduler.listJobs().some((j) => j.id === "zombie_candidate")).toBe(true);
+
+    // Remove job
+    const removed = scheduler.removeJob("zombie_candidate");
+    expect(removed).toBe(true);
+    expect(scheduler.listJobs().some((j) => j.id === "zombie_candidate")).toBe(false);
+
+    // Simulate stale disk state restoring deleted job
+    const storageFile = path.join(testSessionsDir, "cron-jobs.json");
+    const staleContent = JSON.stringify([
+      {
+        id: "zombie_candidate",
+        cronExpression: "0 8 * * *",
+        prompt: "test zombie",
+        chatId: 12345,
+        enabled: true,
+        createdAt: Date.now(),
+      },
+    ]);
+    fs.writeFileSync(storageFile, staleContent, "utf-8");
+
+    // Reload from disk
+    scheduler.reload();
+
+    // The zombie job must NOT be resurrected because of tombstone!
+    expect(scheduler.listJobs().some((j) => j.id === "zombie_candidate")).toBe(false);
+
+    // Now re-add explicitly: should succeed and clear tombstone
+    const reAdd = scheduler.addJob({
+      id: "zombie_candidate",
+      cronExpression: "0 9 * * *",
+      prompt: "test reincarnated",
+      chatId: 12345,
+    });
+    expect(reAdd.ok).toBe(true);
+    expect(scheduler.listJobs().some((j) => j.id === "zombie_candidate")).toBe(true);
+  });
 });

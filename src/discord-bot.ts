@@ -1,3 +1,4 @@
+import os from "os";
 import fs from "fs";
 import path from "path";
 import {
@@ -389,7 +390,7 @@ async function executeDiscordCommand(
     }
     const info = getActiveTunnelInfo();
     if (info.active && info.url) {
-      const username = process.env.USER || "u0_a239";
+      const username = process.env.USER || process.env.LOGNAME || os.userInfo()?.username || "user";
       const sshCmd = `ssh -p 8022 -o ProxyCommand='cloudflared access ssh --hostname %h' ${username}@${info.host}`;
       await reply(
         `🟢 **SSH Cloudflare Tunnel Aktif!**\n• **URL:** \`${info.url}\`\n• **Host:** \`${info.host}\`\n• **PID:** \`${info.pid}\`\n\n**Perintah SSH:**\n\`${sshCmd}\``

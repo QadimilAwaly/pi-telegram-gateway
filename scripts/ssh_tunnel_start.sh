@@ -43,5 +43,5 @@ echo "$URL" > "$URL_FILE"
 HOST="${URL#https://}"
 echo "TUNNEL AKTIF"
 echo "URL: $URL"
-USER_NAME=$(whoami 2>/dev/null || echo "u0_a239")
+USER_NAME=$(whoami 2>/dev/null || echo "${USER:-${LOGNAME:-user}}")
 echo "ssh -p $SSHD_PORT -o ProxyCommand='cloudflared access ssh --hostname %h' ${USER_NAME}@$HOST"

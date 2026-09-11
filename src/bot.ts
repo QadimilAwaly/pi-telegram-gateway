@@ -324,10 +324,12 @@ bot.command("restart", async (ctx) => {
 // Helper: Fetch Termux Battery Status
 async function getDeviceBatteryStatus(): Promise<string | null> {
   try {
-    const binPath = "/data/data/com.termux/files/usr/bin/termux-battery-status";
+    const termuxPrefix = process.env.PREFIX || (fs.existsSync("/data/data/com.termux/files/usr") ? "/data/data/com.termux/files/usr" : "/usr");
+    const binPath = path.join(termuxPrefix, "bin", "termux-battery-status");
+    const binDir = path.join(termuxPrefix, "bin");
     const { stdout } = await execFileAsync(binPath, [], {
       timeout: 2000,
-      env: { ...process.env, PATH: "/data/data/com.termux/files/usr/bin:" + (process.env.PATH || "") },
+      env: { ...process.env, PATH: `${binDir}:${process.env.PATH || ""}` },
     });
     const data = JSON.parse(stdout);
     const pct = data.percentage ?? data.level;

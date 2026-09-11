@@ -1,9 +1,62 @@
 import path from "path";
 import fs from "fs";
+import os from "os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
+
+function getUsername(): string {
+  if (process.env.USER) return process.env.USER;
+  if (process.env.LOGNAME) return process.env.LOGNAME;
+  try {
+    const info = os.userInfo();
+    if (info?.username) return info.username;
+  } catch {}
+  return "user";
+}
+
+function getTermuxPrefix(): string {
+  if (process.env.PREFIX && fs.existsSync(process.env.PREFIX)) {
+    return process.env.PREFIX;
+  }
+  const relativePrefix = path.resolve(os.homedir(), "../usr");
+  if (fs.existsSync(relativePrefix)) {
+    return relativePrefix;
+  }
+  return "/usr";
+}
+
+function getBashPath(): string {
+  const prefix = getTermuxPrefix();
+  const prefixBash = path.join(prefix, "bin", "bash");
+  if (fs.existsSync(prefixBash)) {
+    return prefixBash;
+  }
+  if (process.env.SHELL && fs.existsSync(process.env.SHELL)) {
+    return process.env.SHELL;
+  }
+  if (fs.existsSync("/bin/bash")) {
+    return "/bin/bash";
+  }
+  if (fs.existsSync("/usr/bin/bash")) {
+    return "/usr/bin/bash";
+  }
+  return "bash";
+}
+
+function getTunnelEnv(): NodeJS.ProcessEnv {
+  const home = process.env.HOME || os.homedir();
+  const prefix = getTermuxPrefix();
+  const binDir = path.join(prefix, "bin");
+  const pathEnv = process.env.PATH ? `${binDir}:${process.env.PATH}` : binDir;
+
+  return {
+    ...process.env,
+    PATH: pathEnv,
+    HOME: home,
+  };
+}
 
 const TUNNEL_START_SCRIPT = path.resolve(__dirname, "../scripts/ssh_tunnel_start.sh");
 const TUNNEL_STOP_SCRIPT = path.resolve(__dirname, "../scripts/ssh_tunnel_stop.sh");
@@ -17,6 +70,45 @@ export interface TunnelInfo {
   host?: string;
 }
 
+export function isProcessMatching(pid: number, expectedBinary: RegExp | string): boolean {
+  try {
+    process.kill(pid, 0);
+  } catch {
+    return false;
+  }
+
+  // Guard against PID reuse by inspecting procfs executable identity
+  try {
+    const commPath = `/proc/${pid}/comm`;
+    if (fs.existsSync(commPath)) {
+      const comm = fs.readFileSync(commPath, "utf8").trim().toLowerCase();
+      if (typeof expectedBinary === "string") {
+        if (comm === expectedBinary.toLowerCase() || comm.includes(expectedBinary.toLowerCase())) {
+          return true;
+        }
+      } else if (expectedBinary.test(comm)) {
+        return true;
+      }
+    }
+
+    const cmdlinePath = `/proc/${pid}/cmdline`;
+    if (fs.existsSync(cmdlinePath)) {
+      const raw = fs.readFileSync(cmdlinePath, "utf8");
+      const args = raw.split("\0").filter(Boolean);
+      const binaryName = path.basename(args[0] || "").toLowerCase();
+      if (typeof expectedBinary === "string") {
+        return binaryName === expectedBinary.toLowerCase() || binaryName.includes(expectedBinary.toLowerCase());
+      }
+      return expectedBinary.test(binaryName);
+    }
+  } catch {
+    // Fallback for non-Linux or restricted procfs
+    return true;
+  }
+
+  return false;
+}
+
 export function getActiveTunnelInfo(): TunnelInfo {
   try {
     if (!fs.existsSync(TUNNEL_PID_FILE)) {
@@ -28,9 +120,7 @@ export function getActiveTunnelInfo(): TunnelInfo {
       return { active: false };
     }
 
-    try {
-      process.kill(pid, 0);
-    } catch {
+    if (!isProcessMatching(pid, "cloudflared")) {
       return { active: false };
     }
 
@@ -54,7 +144,7 @@ export async function startTunnel(force = false): Promise<{
 }> {
   const current = getActiveTunnelInfo();
   if (current.active && current.url && !force) {
-    const username = process.env.USER || "u0_a239";
+    const username = getUsername();
     const host = current.host || "";
     const sshCmd = `ssh -p 8022 -o ProxyCommand='cloudflared access ssh --hostname %h' ${username}@${host}`;
     const scpCmd = `scp -P 8022 -o ProxyCommand='cloudflared access ssh --hostname %h' ${username}@${host}:~/path ./`;
@@ -81,13 +171,9 @@ export async function startTunnel(force = false): Promise<{
   }
 
   try {
-    const { stdout, stderr } = await execFileAsync("/data/data/com.termux/files/usr/bin/bash", [TUNNEL_START_SCRIPT], {
+    const { stdout, stderr } = await execFileAsync(getBashPath(), [TUNNEL_START_SCRIPT], {
       timeout: 30000,
-      env: {
-        ...process.env,
-        PATH: `/data/data/com.termux/files/usr/bin:${process.env.PATH || ""}`,
-        HOME: "/data/data/com.termux/files/home",
-      },
+      env: getTunnelEnv(),
     });
 
     const output = (stdout || "").trim();
@@ -104,7 +190,7 @@ export async function startTunnel(force = false): Promise<{
     }
 
     const host = url.replace(/^https?:\/\//, "");
-    const username = process.env.USER || "u0_a239";
+    const username = getUsername();
     const sshCmd = `ssh -p 8022 -o ProxyCommand='cloudflared access ssh --hostname %h' ${username}@${host}`;
     const scpCmd = `scp -P 8022 -o ProxyCommand='cloudflared access ssh --hostname %h' ${username}@${host}:~/path ./`;
 
@@ -137,13 +223,9 @@ export async function startTunnel(force = false): Promise<{
 
 export async function stopTunnel(): Promise<{ success: boolean; message: string }> {
   try {
-    const { stdout, stderr } = await execFileAsync("/data/data/com.termux/files/usr/bin/bash", [TUNNEL_STOP_SCRIPT], {
+    const { stdout, stderr } = await execFileAsync(getBashPath(), [TUNNEL_STOP_SCRIPT], {
       timeout: 15000,
-      env: {
-        ...process.env,
-        PATH: `/data/data/com.termux/files/usr/bin:${process.env.PATH || ""}`,
-        HOME: "/data/data/com.termux/files/home",
-      },
+      env: getTunnelEnv(),
     });
 
     const output = (stdout || stderr || "Tunnel dihentikan.").trim();

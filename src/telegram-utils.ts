@@ -4,6 +4,7 @@
  */
 
 const MAX_TG_LENGTH = 4000;
+const VOID_TAGS = new Set(["br", "hr", "img", "input"]);
 
 /**
  * Remove ANSI escape sequences (colors, cursor movements, etc.)
@@ -305,12 +306,11 @@ export function balanceHtmlTags(html: string): string {
   const tagRegex = /<\/?([a-zA-Z0-9]+)(?:\s+[^>]*?)?(\/?)>/g;
   let match: RegExpExecArray | null;
 
-  const voidTags = new Set(["br", "hr", "img", "input"]);
-
+  
   while ((match = tagRegex.exec(html)) !== null) {
     const fullTag = match[0];
     const tagName = match[1]?.toLowerCase();
-    const isSelfClosing = match[2] === "/" || (tagName ? voidTags.has(tagName) : false);
+    const isSelfClosing = match[2] === "/" || (tagName ? VOID_TAGS.has(tagName) : false);
 
     if (!tagName || isSelfClosing) continue;
 
@@ -379,41 +379,63 @@ export function splitMessage(htmlOrMarkdown: string, maxLength: number = MAX_TG_
       }
     }
 
+    // Avoid splitting in the middle of an HTML tag (<...>)
+    const lastOpenAngle = remaining.lastIndexOf("<", splitIdx);
+    const lastCloseAngle = remaining.lastIndexOf(">", splitIdx);
+    if (lastOpenAngle !== -1 && lastOpenAngle > lastCloseAngle) {
+      if (lastOpenAngle > effectiveLimit / 3) {
+        splitIdx = lastOpenAngle;
+      } else {
+        const nextClose = remaining.indexOf(">", splitIdx);
+        if (nextClose !== -1 && nextClose < maxLength) {
+          splitIdx = nextClose + 1;
+        }
+      }
+    }
+
     const chunk = remaining.substring(0, splitIdx);
     remaining = remaining.substring(splitIdx).trimStart();
 
-    // Inspect active open tags in this chunk
-    const currentOpenTags: string[] = [];
+    // Inspect active open tags in this chunk, preserving full open tag with attributes
+    interface OpenTagInfo {
+      name: string;
+      openTag: string;
+    }
+    const currentOpenTags: OpenTagInfo[] = [];
     const tagRegex = /<\/?([a-zA-Z0-9]+)(?:\s+[^>]*?)?(\/?)>/g;
     let match: RegExpExecArray | null;
 
     while ((match = tagRegex.exec(chunk)) !== null) {
       const fullTag = match[0];
       const tagName = match[1]?.toLowerCase();
-      if (!tagName) continue;
+      const isSelfClosing = match[2] === "/" || (tagName ? VOID_TAGS.has(tagName) : false);
+      if (!tagName || isSelfClosing) continue;
 
       if (fullTag.startsWith("</")) {
-        const last = currentOpenTags.lastIndexOf(tagName);
+        const last = currentOpenTags.map((t) => t.name).lastIndexOf(tagName);
         if (last !== -1) {
           currentOpenTags.splice(last, 1);
         }
-      } else if (!match[2]) {
-        currentOpenTags.push(tagName);
+      } else {
+        currentOpenTags.push({ name: tagName, openTag: fullTag });
       }
     }
 
-    // Close open tags on this chunk
+    // Close open tags on this chunk in reverse order
     let closingTags = "";
     for (let i = currentOpenTags.length - 1; i >= 0; i--) {
-      closingTags += `</${currentOpenTags[i]}>`;
+      const tag = currentOpenTags[i];
+      if (tag) {
+        closingTags += `</${tag.name}>`;
+      }
     }
 
     chunks.push(chunk + closingTags);
 
-    // Reopen tags for subsequent chunk
+    // Reopen tags for subsequent chunk in forward order, preserving attributes (e.g. <a href="...">)
     let reopeningTags = "";
     for (const tag of currentOpenTags) {
-      reopeningTags += `<${tag}>`;
+      reopeningTags += tag.openTag;
     }
     remaining = reopeningTags + remaining;
   }

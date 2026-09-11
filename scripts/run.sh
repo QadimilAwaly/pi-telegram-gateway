@@ -3,10 +3,13 @@
 # Pi Telegram Gateway Daemon Runner for Termux
 # ==============================================================================
 
-DIR="/data/data/com.termux/files/home/pi-telegram-gateway"
-LOCK_FILE="/data/data/com.termux/files/home/.pi/telegram-sessions/gateway.lock"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+SESSIONS_DIR="${SESSIONS_DIR:-$HOME/.pi/telegram-sessions}"
+LOCK_FILE="$SESSIONS_DIR/gateway.lock"
 
-export PATH="/data/data/com.termux/files/home/.bun/bin:/data/data/com.termux/files/usr/bin:$PATH"
+PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+export PATH="$HOME/.bun/bin:$PREFIX/bin:$PATH"
 
 cd "$DIR" || exit 1
 

@@ -1,12 +1,20 @@
 import fs from "fs";
 import path from "path";
+import os from "os";
 import zlib from "node:zlib";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { config } from "./config";
 
 const execFileAsync = promisify(execFile);
-const MNEMOSYNE_DATA_DIR = process.env.MNEMOSYNE_DATA_DIR || "/storage/emulated/0/backup/shared_memory";
+const gzipAsync = promisify(zlib.gzip);
+function getMnemosyneDir(): string {
+  if (process.env.MNEMOSYNE_DATA_DIR) return process.env.MNEMOSYNE_DATA_DIR;
+  const sharedStorage = "/storage/emulated/0/backup/shared_memory";
+  if (fs.existsSync(sharedStorage)) return sharedStorage;
+  return path.join(os.homedir(), ".mnemosyne");
+}
+const MNEMOSYNE_DATA_DIR = getMnemosyneDir();
 
 export interface ArchivedSessionMeta {
   archiveId: string;
@@ -216,8 +224,8 @@ except Exception as e:
           fs.writeFileSync(exportedMdFile, markdown, "utf-8");
         }
 
-        // 2. Compress via Gzip
-        const compressed = zlib.gzipSync(rawBuffer, { level: 9 });
+        // 2. Compress via Gzip (async)
+        const compressed = await gzipAsync(rawBuffer, { level: 9 });
         const compressedSize = compressed.length;
         const archiveFileName = `${item.name}.gz`;
         const archiveFullPath = path.join(archiveDir, archiveFileName);

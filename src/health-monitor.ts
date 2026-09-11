@@ -16,6 +16,7 @@ export interface GatewayHealthState {
   totalDiskSessions: number;
   activeCronJobs: number;
   defaultModel: string;
+  defaultCwd: string;
   memoryUsageMb: {
     rss: number;
     heapUsed: number;
@@ -97,6 +98,7 @@ export class HealthMonitor {
       totalDiskSessions: this.countDiskSessions(),
       activeCronJobs: cronScheduler.listJobs().filter((j) => j.enabled).length,
       defaultModel: activeModel,
+      defaultCwd: config.defaultCwd,
       memoryUsageMb: {
         rss: +(mem.rss / (1024 * 1024)).toFixed(1),
         heapUsed: +(mem.heapUsed / (1024 * 1024)).toFixed(1),
