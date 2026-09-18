@@ -222,7 +222,7 @@ class SyncAction:
         models_store_models: List[Dict],
     ) -> Tuple[List[Dict], List[Dict]]:
         """Add new models from OpenRouter to local config."""
-        new_models = diff.get("new", [])
+        new_models = diff.get("new_free", [])
         provider_filter = self.sync_cfg.get("providers", ["openrouter"])
 
         added_to_nous = []
