@@ -135,6 +135,64 @@ export function getActiveTunnelInfo(): TunnelInfo {
   }
 }
 
+function formatTunnelHtml(info: { url: string; host: string; pid?: number }, title: string): string {
+  const username = getUsername();
+  const sshCmd = `ssh -p 8022 -o ProxyCommand='cloudflared access ssh --hostname %h' ${username}@${info.host}`;
+  const scpCmd = `scp -P 8022 -o ProxyCommand='cloudflared access ssh --hostname %h' ${username}@${info.host}:~/path ./`;
+
+  const lines = [
+    title,
+    "",
+    `🌐 <b>URL:</b> <code>${info.url}</code>`,
+    `🖥️ <b>Host:</b> <code>${info.host}</code>`,
+    `👤 <b>User:</b> <code>${username}</code>`,
+    `🔌 <b>Port:</b> <code>8022</code>`,
+  ];
+  if (info.pid) {
+    lines.push(`⚙️ <b>PID:</b> <code>${info.pid}</code>`);
+  }
+  lines.push(
+    "",
+    "📋 <b>Perintah SSH:</b>",
+    `<code>${sshCmd}</code>`,
+    "",
+    "📁 <b>Transfer File (SCP):</b>",
+    `<code>${scpCmd}</code>`,
+    "",
+    "💡 <i>Ketik <code>/tunnel-close</code> untuk mematikan tunnel saat selesai.</i>"
+  );
+  return lines.join("\n");
+}
+
+export function formatTunnelMarkdown(info: { url: string; host: string; pid?: number }, title: string): string {
+  const username = getUsername();
+  const sshCmd = `ssh -p 8022 -o ProxyCommand='cloudflared access ssh --hostname %h' ${username}@${info.host}`;
+  const scpCmd = `scp -P 8022 -o ProxyCommand='cloudflared access ssh --hostname %h' ${username}@${info.host}:~/path ./`;
+
+  const lines = [
+    title,
+    "",
+    `• **URL:** \`${info.url}\``,
+    `• **Host:** \`${info.host}\``,
+    `• **User:** \`${username}\``,
+    `• **Port:** \`8022\``,
+  ];
+  if (info.pid) {
+    lines.push(`• **PID:** \`${info.pid}\``);
+  }
+  lines.push(
+    "",
+    "**Perintah SSH:**",
+    `\`${sshCmd}\``,
+    "",
+    "**Transfer File (SCP):**",
+    `\`${scpCmd}\``,
+    "",
+    "*Gunakan `/tunnel-close` untuk mematikan tunnel saat selesai.*"
+  );
+  return lines.join("\n");
+}
+
 export async function startTunnel(force = false): Promise<{
   success: boolean;
   message: string;
@@ -144,30 +202,11 @@ export async function startTunnel(force = false): Promise<{
 }> {
   const current = getActiveTunnelInfo();
   if (current.active && current.url && !force) {
-    const username = getUsername();
-    const host = current.host || "";
-    const sshCmd = `ssh -p 8022 -o ProxyCommand='cloudflared access ssh --hostname %h' ${username}@${host}`;
-    const scpCmd = `scp -P 8022 -o ProxyCommand='cloudflared access ssh --hostname %h' ${username}@${host}:~/path ./`;
-
-    const text = [
-      "ℹ️ <b>Cloudflare SSH Tunnel Sudah Berjalan!</b>",
-      "",
-      `🔗 <b>URL:</b> <code>${current.url}</code>`,
-      `🖥️ <b>Host:</b> <code>${host}</code>`,
-      `👤 <b>User:</b> <code>${username}</code>`,
-      `🔌 <b>Port:</b> <code>8022</code>`,
-      `📦 <b>PID:</b> <code>${current.pid}</code>`,
-      "",
-      "📋 <b>Perintah SSH:</b>",
-      `<code>${sshCmd}</code>`,
-      "",
-      "📁 <b>Transfer File (SCP):</b>",
-      `<code>${scpCmd}</code>`,
-      "",
-      "💡 <i>Ketik <code>/tunnel-close</code> untuk mematikan tunnel saat selesai.</i>",
-    ].join("\n");
-
-    return { success: true, message: text, alreadyActive: true, url: current.url, host };
+    const text = formatTunnelHtml(
+      { url: current.url, host: current.host || "", pid: current.pid },
+      "ℹ️ <b>Cloudflare SSH Tunnel Sudah Berjalan!</b>"
+    );
+    return { success: true, message: text, alreadyActive: true, url: current.url, host: current.host };
   }
 
   try {
@@ -190,26 +229,10 @@ export async function startTunnel(force = false): Promise<{
     }
 
     const host = url.replace(/^https?:\/\//, "");
-    const username = getUsername();
-    const sshCmd = `ssh -p 8022 -o ProxyCommand='cloudflared access ssh --hostname %h' ${username}@${host}`;
-    const scpCmd = `scp -P 8022 -o ProxyCommand='cloudflared access ssh --hostname %h' ${username}@${host}:~/path ./`;
-
-    const text = [
-      "🚀 <b>Cloudflare SSH Tunnel Aktif!</b>",
-      "",
-      `🔗 <b>URL:</b> <code>${url}</code>`,
-      `🖥️ <b>Host:</b> <code>${host}</code>`,
-      `👤 <b>User:</b> <code>${username}</code>`,
-      `🔌 <b>Port:</b> <code>8022</code>`,
-      "",
-      "📋 <b>Perintah SSH (Salin & Jalankan):</b>",
-      `<code>${sshCmd}</code>`,
-      "",
-      "📁 <b>Transfer File (SCP):</b>",
-      `<code>${scpCmd}</code>`,
-      "",
-      "💡 <i>Ketik <code>/tunnel-close</code> untuk mematikan tunnel saat selesai.</i>",
-    ].join("\n");
+    const text = formatTunnelHtml(
+      { url, host },
+      "🚀 <b>Cloudflare SSH Tunnel Aktif!</b>"
+    );
 
     return { success: true, message: text, url, host };
   } catch (err: any) {

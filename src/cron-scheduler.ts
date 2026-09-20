@@ -8,7 +8,7 @@ import {
   type AgentSession,
 } from "@earendil-works/pi-coding-agent";
 import { config } from "./config";
-import { sessionPool, type Model } from "./session-pool";
+import { sessionPool } from "./session-pool";
 import { sessionArchiver } from "./session-archiver";
 import { splitMessage, markdownToTelegramHtml, escapeHtml } from "./telegram-utils";
 
@@ -560,6 +560,72 @@ export class CronScheduler {
     this.saveJobs();
     this.scheduleJob(job);
     return true;
+  }
+
+  private async dispatchJobResult(
+    job: CronJobConfig,
+    output: string,
+    durationMs: number,
+    manual: boolean,
+    isNoAgent: boolean
+  ) {
+    const timeStr = new Date().toLocaleString("id-ID", {
+      timeZone: job.timezone || this.defaultTimezone,
+    });
+    const modeTag = isNoAgent ? "⚡ Direct Script" : "🧠 Agent";
+    const triggerTg = manual ? " <i>[Manual Run]</i>" : "";
+    const triggerDc = manual ? " *[Manual Run]*" : "";
+
+    if (this.bot && job.chatId) {
+      const title = `⏰ <b>[Scheduled Task]</b> <b>${escapeHtml(job.name || job.id)}</b> (${modeTag})${triggerTg}\n📅 <i>${escapeHtml(timeStr)}</i> | ⏱️ <i>${(durationMs / 1000).toFixed(2)}s</i>\n\n`;
+      const htmlBody = markdownToTelegramHtml(output);
+      const chunks = splitMessage(title + htmlBody);
+
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i]!;
+        try {
+          await this.bot.api.sendMessage(job.chatId, chunk, { parse_mode: "HTML" });
+        } catch {
+          await this.bot.api.sendMessage(job.chatId, chunk.replace(/<[^>]*>/g, ""));
+        }
+        if (i < chunks.length - 1) {
+          await new Promise((r) => setTimeout(r, 250));
+        }
+      }
+    }
+
+    if (this.discordSender) {
+      try {
+        const title = `⏰ **[Scheduled Task]** **${job.name || job.id}** (${modeTag})${triggerDc}\n📅 *${timeStr}* | ⏱️ *${(durationMs / 1000).toFixed(2)}s*\n\n`;
+        await this.discordSender(title, output);
+      } catch (err: any) {
+        console.error("❌ [Cron Discord] Error sending output:", err.message);
+      }
+    }
+  }
+
+  private async dispatchJobError(
+    job: CronJobConfig,
+    errMsg: string,
+    durationMs: number,
+    isNoAgent: boolean
+  ) {
+    const modeTag = isNoAgent ? "⚡ Direct Script" : "🧠 Agent";
+    const safeErrDisplay = errMsg.length > 2500 ? errMsg.slice(0, 2450) + "\n...[truncated]" : errMsg;
+
+    if (this.bot && job.chatId) {
+      const errorMsg = `⚠️ <b>[Scheduled Task Error]</b> <b>${escapeHtml(job.name || job.id)}</b> (${modeTag})\n⏱️ <i>Duration: ${(durationMs / 1000).toFixed(2)}s</i>\n\n<pre>${escapeHtml(safeErrDisplay)}</pre>`;
+      await this.bot.api.sendMessage(job.chatId, errorMsg, { parse_mode: "HTML" }).catch(() => {});
+    }
+
+    if (this.discordSender) {
+      try {
+        const title = `⚠️ **[Scheduled Task Error]** **${job.name || job.id}** (${modeTag})\n⏱️ *${(durationMs / 1000).toFixed(2)}s*\n\n`;
+        await this.discordSender(title, "```text\n" + safeErrDisplay.slice(0, 1800) + "\n```");
+      } catch (dErr: any) {
+        console.error("❌ [Cron Discord] Error broadcasting task error:", dErr.message);
+      }
+    }
   }
 
   async executeJob(id: string, manual: boolean = false): Promise<string> {

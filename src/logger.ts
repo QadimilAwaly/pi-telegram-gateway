@@ -15,6 +15,7 @@ export interface LogEntry {
 export class GatewayLogger {
   private logFile: string;
   private maxFileSizeBytes: number = 3 * 1024 * 1024; // 3MB per file
+  private currentFileSizeBytes: number = 0;
   private ringBuffer: LogEntry[] = [];
   private maxRingBufferSize: number = 200;
   private originalConsole: {
@@ -24,6 +25,7 @@ export class GatewayLogger {
     error: typeof console.error;
   } | null = null;
   private isInitialized: boolean = false;
+  private hasLoadedExistingLogs: boolean = false;
 
   // Duplicate suppression state
   private lastMessage: string = "";
@@ -42,6 +44,14 @@ export class GatewayLogger {
 
     if (!fs.existsSync(config.sessionsDir)) {
       fs.mkdirSync(config.sessionsDir, { recursive: true });
+    }
+
+    try {
+      if (fs.existsSync(this.logFile)) {
+        this.currentFileSizeBytes = fs.statSync(this.logFile).size;
+      }
+    } catch {
+      this.currentFileSizeBytes = 0;
     }
 
     // Save original console functions
@@ -81,6 +91,7 @@ export class GatewayLogger {
 
   private loadExistingLogsFromFile(maxLines: number = 200) {
     try {
+      this.hasLoadedExistingLogs = true;
       if (!fs.existsSync(this.logFile)) return;
       const content = fs.readFileSync(this.logFile, "utf-8");
       const lines = content.split("\n").filter((l) => l.trim().length > 0);
@@ -126,24 +137,22 @@ export class GatewayLogger {
       .join(" ");
   }
 
-  private rotateIfNecessary() {
+  private rotateLog() {
     try {
       if (fs.existsSync(this.logFile)) {
-        const stat = fs.statSync(this.logFile);
-        if (stat.size > this.maxFileSizeBytes) {
-          const oldFile = `${this.logFile}.old`;
-          if (fs.existsSync(oldFile)) {
-            fs.unlinkSync(oldFile);
-          }
-          fs.renameSync(this.logFile, oldFile);
+        const oldFile = `${this.logFile}.old`;
+        if (fs.existsSync(oldFile)) {
+          fs.unlinkSync(oldFile);
         }
+        fs.renameSync(this.logFile, oldFile);
       }
+      this.currentFileSizeBytes = 0;
     } catch {}
   }
 
   private commitEntry(level: LogLevel, cleanMsg: string, now: Date = new Date()) {
     const timeStr = now.toLocaleString("id-ID", {
-      timeZone: "Asia/Makassar",
+      timeZone: config.defaultTimezone,
       dateStyle: "short",
       timeStyle: "medium",
     });
@@ -161,17 +170,22 @@ export class GatewayLogger {
       this.ringBuffer.shift();
     }
 
-    // 2. Persistent Rotating Log File
+    // 2. Persistent Rotating Log File (in-memory size tracking avoids sync stat overhead on each log)
     try {
-      this.rotateIfNecessary();
       const line = `[${timeStr}] [${level}] ${cleanMsg}\n`;
+      const lineBytes = Buffer.byteLength(line, "utf-8");
+
+      if (this.currentFileSizeBytes + lineBytes > this.maxFileSizeBytes) {
+        this.rotateLog();
+      }
+
       fs.appendFileSync(this.logFile, line, "utf-8");
+      this.currentFileSizeBytes += lineBytes;
     } catch {}
   }
 
   private flushDuplicates(now: Date = new Date()) {
     if (this.repeatCount === 1) {
-      // Natural 2-time occurrences are logged as is without noisy suppress notices
       this.commitEntry(this.lastLevel, this.lastMessage, now);
     } else if (this.repeatCount > 1) {
       const msg = `⚠️ [Suppressed] (Previous ${this.lastLevel} message repeated ${this.repeatCount} times)`;
@@ -220,27 +234,15 @@ export class GatewayLogger {
   }
 
   info(...args: any[]) {
-    if (this.originalConsole) {
-      this.originalConsole.info(...args);
-    } else {
-      console.info(...args);
-    }
+    console.info(...args);
   }
 
   warn(...args: any[]) {
-    if (this.originalConsole) {
-      this.originalConsole.warn(...args);
-    } else {
-      console.warn(...args);
-    }
+    console.warn(...args);
   }
 
   error(...args: any[]) {
-    if (this.originalConsole) {
-      this.originalConsole.error(...args);
-    } else {
-      console.error(...args);
-    }
+    console.error(...args);
   }
 
   /**
@@ -253,9 +255,8 @@ export class GatewayLogger {
     const limit = Math.min(options.limit || 20, 100);
     const level = options.level || "ALL";
 
-    // If buffer has fewer items than requested, reload from persistent log file
-    if (this.ringBuffer.length < limit && fs.existsSync(this.logFile)) {
-      this.ringBuffer = [];
+    // Only load from disk if not yet loaded
+    if (!this.hasLoadedExistingLogs && fs.existsSync(this.logFile)) {
       this.loadExistingLogsFromFile(Math.max(limit * 2, 200));
     }
 
@@ -275,6 +276,7 @@ export class GatewayLogger {
     this.lastMessage = "";
     this.repeatCount = 0;
     this.lastRepeatReported = 0;
+    this.currentFileSizeBytes = 0;
     try {
       if (fs.existsSync(this.logFile)) {
         fs.writeFileSync(this.logFile, "", "utf-8");
@@ -294,6 +296,9 @@ export class GatewayLogger {
   }
 
   getLogFileSizeKb(): number {
+    if (this.currentFileSizeBytes > 0) {
+      return Math.round(this.currentFileSizeBytes / 1024);
+    }
     try {
       if (fs.existsSync(this.logFile)) {
         return Math.round(fs.statSync(this.logFile).size / 1024);

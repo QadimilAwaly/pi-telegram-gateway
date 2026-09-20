@@ -6,21 +6,16 @@ import {
   GatewayIntentBits,
   Partials,
   Message,
-  ChatInputCommandInteraction,
 } from "discord.js";
 import { config } from "./config";
-import { sessionPool, type Model } from "./session-pool";
+import { sessionPool } from "./session-pool";
 import { cronScheduler } from "./cron-scheduler";
 import { splitDiscordMessage, formatDiscordToolStatus } from "./discord-utils";
-import { getActiveTunnelInfo, startTunnel, stopTunnel } from "./tunnel-manager";
+import { getActiveTunnelInfo, startTunnel, stopTunnel, formatTunnelMarkdown } from "./tunnel-manager";
 import { gatewayLogger } from "./logger";
 
 gatewayLogger.init();
 
-if (!config.discordBotToken) {
-  console.error("❌ ERROR: DISCORD_BOT_TOKEN is not defined in environment or .env!");
-  process.exit(1);
-}
 
 export const discordClient = new Client({
   intents: [
@@ -385,16 +380,16 @@ async function executeDiscordCommand(
     if (commandName === "tunnel-open" || sub === "open" || sub === "start" || sub === "restart") {
       await reply("⏳ **Menghubungkan SSH tunnel ke Cloudflare...** Mohon tunggu...");
       const res = await startTunnel(sub === "restart");
-      await reply(res.message.replace(/<[^>]*>/g, ""));
+      if (res.url && res.host) {
+        await reply(formatTunnelMarkdown({ url: res.url, host: res.host }, res.alreadyActive ? "Cloudflare SSH Tunnel Sudah Berjalan!" : "Cloudflare SSH Tunnel Aktif!"));
+      } else {
+        await reply(res.message.replace(/<[^>]*>/g, ""));
+      }
       return true;
     }
     const info = getActiveTunnelInfo();
     if (info.active && info.url) {
-      const username = process.env.USER || process.env.LOGNAME || os.userInfo()?.username || "user";
-      const sshCmd = `ssh -p 8022 -o ProxyCommand='cloudflared access ssh --hostname %h' ${username}@${info.host}`;
-      await reply(
-        `🟢 **SSH Cloudflare Tunnel Aktif!**\n• **URL:** \`${info.url}\`\n• **Host:** \`${info.host}\`\n• **PID:** \`${info.pid}\`\n\n**Perintah SSH:**\n\`${sshCmd}\``
-      );
+      await reply(formatTunnelMarkdown({ url: info.url, host: info.host || "", pid: info.pid }, "SSH Cloudflare Tunnel Aktif!"));
     } else {
       await reply("⚪ **Cloudflare SSH Tunnel saat ini INAKTIF.**\nKetik `/tunnel-open` untuk membuka akses remote.");
     }
@@ -750,6 +745,9 @@ discordClient.on("messageCreate", async (message: Message) => {
 
 // Run Discord Gateway
 export async function startDiscordGateway() {
+  if (!config.discordBotToken) {
+    throw new Error("DISCORD_BOT_TOKEN is not defined in environment or .env");
+  }
   await sessionPool.init();
   await discordClient.login(config.discordBotToken);
 }

@@ -1,5 +1,4 @@
 import path from "path";
-import os from "os";
 import {
   createBashTool,
   createEditTool,
@@ -70,6 +69,20 @@ export function isDangerousCommand(cmd: string): { blocked: boolean; reason?: st
 }
 
 /**
+ * Validates if a target path points to the protected host gateway codebase.
+ */
+function isProtectedGatewayPath(targetPath: string): boolean {
+  const norm = path.resolve(targetPath);
+  return (
+    norm.startsWith(path.join(gatewayDir, "src")) ||
+    norm.startsWith(path.join(gatewayDir, "scripts")) ||
+    norm === path.join(gatewayDir, "package.json") ||
+    norm === path.join(gatewayDir, ".env") ||
+    norm === path.join(gatewayDir, "tsconfig.json")
+  );
+}
+
+/**
  * Pi Extension Factory that protects the Gateway from being killed or modified destructively,
  * and guarantees that no bash execution can hang indefinitely.
  */
@@ -91,11 +104,45 @@ export function gatewaySafetyExtension(pi: ExtensionAPI) {
     };
   });
 
-  // 2. Intercept and override bash tool execution using Pi's native createBashTool
-  const nativeBashTool = createBashTool(config.defaultCwd);
+  // Tool instances cache by cwd to prevent excessive garbage generation
+  const bashTools = new Map<string, any>();
+  const editTools = new Map<string, any>();
+  const writeTools = new Map<string, any>();
 
+  const getBashTool = (cwd?: string) => {
+    const dir = cwd || config.defaultCwd;
+    let tool = bashTools.get(dir);
+    if (!tool) {
+      tool = createBashTool(dir);
+      bashTools.set(dir, tool);
+    }
+    return tool;
+  };
+
+  const getEditTool = (cwd?: string) => {
+    const dir = cwd || config.defaultCwd;
+    let tool = editTools.get(dir);
+    if (!tool) {
+      tool = createEditTool(dir);
+      editTools.set(dir, tool);
+    }
+    return tool;
+  };
+
+  const getWriteTool = (cwd?: string) => {
+    const dir = cwd || config.defaultCwd;
+    let tool = writeTools.get(dir);
+    if (!tool) {
+      tool = createWriteTool(dir);
+      writeTools.set(dir, tool);
+    }
+    return tool;
+  };
+
+  // 2. Intercept and override bash tool execution using Pi's native createBashTool
+  const baseBashTool = getBashTool(config.defaultCwd);
   pi.registerTool({
-    ...nativeBashTool,
+    ...baseBashTool,
     name: "bash",
     label: "bash (gateway-protected)",
     description: "Execute a bash command with active protection for the host Telegram gateway daemon.",
@@ -123,7 +170,7 @@ export function gatewaySafetyExtension(pi: ExtensionAPI) {
       };
 
       try {
-        const toolToUse = ctx?.cwd ? createBashTool(ctx.cwd) : nativeBashTool;
+        const toolToUse = getBashTool(ctx?.cwd);
         return await toolToUse.execute(toolCallId, paramsWithTimeout, signal, onUpdate);
       } catch (err: any) {
         console.error(`⚠️ [Bash Tool Error]:`, err.message);
@@ -136,19 +183,15 @@ export function gatewaySafetyExtension(pi: ExtensionAPI) {
   });
 
   // 3. Intercept and override edit tool with active gateway codebase protection
-  const nativeEditTool = createEditTool(config.defaultCwd);
+  const baseEditTool = getEditTool(config.defaultCwd);
   pi.registerTool({
-    ...nativeEditTool,
+    ...baseEditTool,
     name: "edit",
     label: "edit (gateway-protected)",
     description: "Edit a file with active protection for the host gateway codebase.",
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
       const targetPath = path.resolve(ctx?.cwd || config.defaultCwd, params?.path || "");
-      if (
-        targetPath.startsWith(path.join(gatewayDir, "src")) ||
-        targetPath.startsWith(path.join(gatewayDir, "scripts")) ||
-        targetPath === path.join(gatewayDir, "package.json")
-      ) {
+      if (isProtectedGatewayPath(targetPath)) {
         const reason = `Blocked edit targeting host gateway codebase (${targetPath}). Modifying the gateway source code from inside its own session is prohibited to prevent daemon crashes.`;
         console.warn(`🛡️ [Safety Guard] Intercepted edit: ${reason}`);
         return {
@@ -156,25 +199,21 @@ export function gatewaySafetyExtension(pi: ExtensionAPI) {
           details: { blocked: true, reason },
         };
       }
-      const toolToUse = ctx?.cwd ? createEditTool(ctx.cwd) : nativeEditTool;
+      const toolToUse = getEditTool(ctx?.cwd);
       return await toolToUse.execute(toolCallId, params, signal, onUpdate);
     },
   });
 
   // 4. Intercept and override write tool with active gateway codebase protection
-  const nativeWriteTool = createWriteTool(config.defaultCwd);
+  const baseWriteTool = getWriteTool(config.defaultCwd);
   pi.registerTool({
-    ...nativeWriteTool,
+    ...baseWriteTool,
     name: "write",
     label: "write (gateway-protected)",
     description: "Write a file with active protection for the host gateway codebase.",
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
       const targetPath = path.resolve(ctx?.cwd || config.defaultCwd, params?.path || "");
-      if (
-        targetPath.startsWith(path.join(gatewayDir, "src")) ||
-        targetPath.startsWith(path.join(gatewayDir, "scripts")) ||
-        targetPath === path.join(gatewayDir, "package.json")
-      ) {
+      if (isProtectedGatewayPath(targetPath)) {
         const reason = `Blocked write targeting host gateway codebase (${targetPath}). Modifying the gateway source code from inside its own session is prohibited to prevent daemon crashes.`;
         console.warn(`🛡️ [Safety Guard] Intercepted write: ${reason}`);
         return {
@@ -182,7 +221,7 @@ export function gatewaySafetyExtension(pi: ExtensionAPI) {
           details: { blocked: true, reason },
         };
       }
-      const toolToUse = ctx?.cwd ? createWriteTool(ctx.cwd) : nativeWriteTool;
+      const toolToUse = getWriteTool(ctx?.cwd);
       return await toolToUse.execute(toolCallId, params, signal, onUpdate);
     },
   });

@@ -72,6 +72,65 @@ export class SessionArchiver {
   /**
    * Parse a JSONL session file to extract basic transcript and message count
    */
+  /**
+   * Fast header peek to extract session summary and message count without full file parsing
+   */
+  peekSessionSummary(filePath: string): { summary: string; count: number } {
+    if (!fs.existsSync(filePath)) return { summary: "Session", count: 0 };
+    try {
+      const fd = fs.openSync(filePath, "r");
+      const buffer = Buffer.alloc(16384);
+      const bytesRead = fs.readSync(fd, buffer, 0, 16384, 0);
+      fs.closeSync(fd);
+
+      let summary = "";
+      if (bytesRead > 0) {
+        const chunk = buffer.toString("utf-8", 0, bytesRead);
+        const lines = chunk.split("\n");
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const entry = JSON.parse(line);
+            if (entry.type === "message" || entry.role) {
+              const role = entry.role || entry.message?.role;
+              if (role === "user") {
+                let text = "";
+                if (typeof entry.content === "string") text = entry.content;
+                else if (Array.isArray(entry.content)) {
+                  text = entry.content.filter((c: any) => c.type === "text" && c.text).map((c: any) => c.text).join(" ");
+                } else if (entry.message?.content) {
+                  const mc = entry.message.content;
+                  if (typeof mc === "string") text = mc;
+                  else if (Array.isArray(mc)) {
+                    text = mc.filter((c: any) => c.type === "text" && c.text).map((c: any) => c.text).join(" ");
+                  }
+                }
+                if (text.trim()) {
+                  summary = text.trim().slice(0, 70).replace(/\s+/g, " ");
+                  break;
+                }
+              }
+            }
+          } catch {}
+        }
+      }
+
+      const content = fs.readFileSync(filePath);
+      let count = 0;
+      for (let i = 0; i < content.length; i++) {
+        if (content[i] === 10) count++;
+      }
+      if (content.length > 0 && content[content.length - 1] !== 10) count++;
+
+      return {
+        summary: summary || `Session (${count} messages)`,
+        count,
+      };
+    } catch {
+      return { summary: "Session", count: 0 };
+    }
+  }
+
   parseSessionFile(filePath: string): { messages: Array<{ role: string; text: string; timestamp?: string }>; count: number } {
     if (!fs.existsSync(filePath)) return { messages: [], count: 0 };
     const content = fs.readFileSync(filePath, "utf-8");
@@ -115,7 +174,7 @@ export class SessionArchiver {
     const { messages } = this.parseSessionFile(filePath);
     const fileName = path.basename(filePath, path.extname(filePath));
     const title = `Session Transcript — ${fileName}`;
-    let md = `# ${title}\n\n*Exported on ${new Date().toLocaleString("id-ID", { timeZone: "Asia/Makassar" })}*\n\n---\n\n`;
+    let md = `# ${title}\n\n*Exported on ${new Date().toLocaleString("id-ID", { timeZone: config.defaultTimezone })}*\n\n---\n\n`;
 
     let userQuestions: string[] = [];
 

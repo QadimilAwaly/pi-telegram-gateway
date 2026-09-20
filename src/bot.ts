@@ -24,13 +24,14 @@ import {
 import { gatewayLogger } from "./logger";
 gatewayLogger.init();
 
-if (!config.botToken) {
+const isTelegramEnabled = config.mode === "dual" || config.mode === "telegram";
+if (isTelegramEnabled && !config.botToken) {
   console.error("❌ ERROR: TELEGRAM_BOT_TOKEN is not defined in environment or .env!");
   console.error("Please create a .env file with your Telegram Bot Token.");
   process.exit(1);
 }
 
-const bot = new Bot(config.botToken, {
+const bot = new Bot(config.botToken || "000000000:DISABLED_TELEGRAM_TOKEN", {
   client: {
     timeoutSeconds: 55,
   },
@@ -1552,7 +1553,6 @@ bot.on(["message:text", "message:photo", "message:document"], async (ctx) => {
   let modelErrorMessage: string | null = null;
   let statusMessageId: number | null = null;
   let intermediateDelivered = false;
-  const conversationalResponses: string[] = [];
   const toolLog: string[] = [];
 
   // Helper to safely send a completed turn message to Telegram
@@ -1620,7 +1620,6 @@ bot.on(["message:text", "message:photo", "message:document"], async (ctx) => {
             modelErrorMessage = event.message.errorMessage;
           }
           const content = (event.message as any).content;
-          const hasToolCalls = Array.isArray(content) && content.some((c: any) => c.type === "toolCall");
           const text = Array.isArray(content)
             ? content.filter((c: any) => c.type === "text").map((c: any) => c.text).join("\n").trim()
             : "";
@@ -1687,7 +1686,6 @@ bot.on(["message:text", "message:photo", "message:document"], async (ctx) => {
         retryCount++;
         modelErrorMessage = null;
         fullResponse = "";
-        conversationalResponses.length = 0;
         await new Promise((resolve) => setTimeout(resolve, 2500));
         continue;
       }
@@ -1706,14 +1704,9 @@ bot.on(["message:text", "message:photo", "message:document"], async (ctx) => {
         return;
       }
 
-      // Deliver all completed conversational responses deterministically (prevents duplicate sends)
-      // Skip final delivery if intermediate reply was already delivered immediately
+      // Deliver response if not already sent intermediate reply
       if (!intermediateDelivered) {
-        if (conversationalResponses.length > 0) {
-          for (const resp of conversationalResponses) {
-            await sendTurnResponse(resp);
-          }
-        } else if (fullResponse && fullResponse.trim()) {
+        if (fullResponse && fullResponse.trim()) {
           await sendTurnResponse(fullResponse);
         } else {
           await sendTurnResponse("*(Completed with no text output)*");
@@ -1729,7 +1722,6 @@ bot.on(["message:text", "message:photo", "message:document"], async (ctx) => {
         retryCount++;
         modelErrorMessage = null;
         fullResponse = "";
-        conversationalResponses.length = 0;
         await new Promise((resolve) => setTimeout(resolve, 2500));
         continue;
       }
@@ -1794,70 +1786,71 @@ async function main() {
     }
   }
 
+    let runner: RunnerHandle | null = null;
+
+  // Graceful shutdown handling (registered once for process lifetime)
+  const shutdown = async () => {
+    console.log("\n🛑 Stopping Pi Gateway...");
+    SingleInstanceGuard.release();
+    healthMonitor.destroy();
+    cronScheduler.destroy();
+    sessionPool.destroy();
+    try {
+      if (discordClient.isReady()) {
+        await discordClient.destroy();
+      }
+    } catch {}
+    try {
+      if (runner && runner.isRunning()) {
+        await runner.stop();
+      }
+    } catch {}
+    process.exit(0);
+  };
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
+
   if (runTelegram) {
     console.log("Starting Pi Telegram Gateway with Concurrent Runner...");
 
-  let runner: RunnerHandle | null = null;
-  let retryDelay = 2000;
-  while (true) {
-    try {
-      await bot.api.deleteWebhook({ drop_pending_updates: false });
-      await bot.init();
-      const botInfo = bot.botInfo;
-      healthMonitor.init(botInfo);
-      console.log(`🚀 Pi Telegram Gateway active as @${botInfo.username}`);
-      console.log(`📂 Working Directory: ${config.defaultCwd}`);
-      console.log(`💾 Sessions Directory: ${config.sessionsDir}`);
-      if (config.allowedUsers.length > 0) {
-        console.log(`🔐 Allowed User IDs: ${config.allowedUsers.join(", ")}`);
-      } else {
-        console.log("⚠️ No ALLOWED_USERS configured (open to any Telegram user)");
-      }
+    let retryDelay = 2000;
+    while (true) {
+      try {
+        await bot.api.deleteWebhook({ drop_pending_updates: false });
+        await bot.init();
+        const botInfo = bot.botInfo;
+        healthMonitor.init(botInfo);
+        console.log(`🤖 Pi Telegram Gateway active as @${botInfo.username}`);
+        console.log(`📂 Working Directory: ${config.defaultCwd}`);
+        console.log(`📁 Sessions Directory: ${config.sessionsDir}`);
+        if (config.allowedUsers.length > 0) {
+          console.log(`🔒 Allowed User IDs: ${config.allowedUsers.join(", ")}`);
+        } else {
+          console.log("⚠️ No ALLOWED_USERS configured (open to any Telegram user)");
+        }
 
-      // Hardened long-polling runner:
-      // - 41s fetch timeout matched with Discord WebSocket heartbeat (41.25s) and 55s client timeout
-      // - Fixed 2000ms retryInterval (prevents unbounded exponential backoff lockup during Android sleep/network drops)
-      // - silent: true suppresses repetitive runner stack trace dumping during network drops
-      runner = run(bot, {
-        runner: {
-          fetch: {
-            timeout: 41,
+        // Hardened long-polling runner:
+        // - 41s fetch timeout matched with Discord WebSocket heartbeat (41.25s) and 55s client timeout
+        // - Fixed 2000ms retryInterval (prevents unbounded exponential backoff lockup during Android sleep/network drops)
+        // - silent: true suppresses repetitive runner stack trace dumping during network drops
+        runner = run(bot, {
+          runner: {
+            fetch: {
+              timeout: 41,
+            },
+            retryInterval: 2000,
+            silent: true,
           },
-          retryInterval: 2000,
-          silent: true,
-        },
-      });
+        });
 
-      // Graceful shutdown handling
-      const shutdown = async () => {
-        console.log("\n🛑 Stopping Pi Telegram Gateway...");
-        SingleInstanceGuard.release();
-        healthMonitor.destroy();
-        cronScheduler.destroy();
-        sessionPool.destroy();
-        try {
-          if (discordClient.isReady()) {
-            await discordClient.destroy();
-          }
-        } catch {}
-        try {
-          if (runner && runner.isRunning()) {
-            await runner.stop();
-          }
-        } catch {}
-        process.exit(0);
-      };
-      process.once("SIGINT", shutdown);
-      process.once("SIGTERM", shutdown);
-
-      await runner.task();
-      break;
-    } catch (err: any) {
-      console.error(`⚠️ Network / Runner error (${err.message}). Auto-reconnecting in ${retryDelay / 1000}s...`);
-      await new Promise((resolve) => setTimeout(resolve, retryDelay));
-      retryDelay = Math.min(retryDelay * 1.5, 30000);
+        await runner.task();
+        break;
+      } catch (err: any) {
+        console.error(`⚠️ Network / Runner error (${err.message}). Auto-reconnecting in ${retryDelay / 1000}s...`);
+        await new Promise((resolve) => setTimeout(resolve, retryDelay));
+        retryDelay = Math.min(retryDelay * 1.5, 30000);
+      }
     }
-  }
   } else {
     // Standalone Discord Mode
     healthMonitor.init({ username: "Hermes_maid_bot", id: 1534861950390112277 });

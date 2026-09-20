@@ -1,6 +1,5 @@
 import fs from "fs";
 import path from "path";
-import os from "os";
 import { config } from "./config";
 import { sessionPool } from "./session-pool";
 import { cronScheduler } from "./cron-scheduler";
@@ -94,7 +93,7 @@ export class HealthMonitor {
       botUsername: this.botInfo?.username || "unknown",
       botId: this.botInfo?.id || 0,
       allowedUsersCount: config.allowedUsers.length,
-      activeMemorySessions: (sessionPool as any).sessions?.size || 0,
+      activeMemorySessions: sessionPool.activeSessionCount,
       totalDiskSessions: this.countDiskSessions(),
       activeCronJobs: cronScheduler.listJobs().filter((j) => j.enabled).length,
       defaultModel: activeModel,

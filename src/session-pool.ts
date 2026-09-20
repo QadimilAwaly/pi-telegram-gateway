@@ -3,8 +3,6 @@ import fs from "fs";
 import {
   createAgentSessionServices,
   createAgentSessionFromServices,
-  DefaultResourceLoader,
-  getAgentDir,
   SessionManager,
   type AgentSession,
 } from "@earendil-works/pi-coding-agent";
@@ -100,6 +98,10 @@ export class SessionPool {
         this.cleanupInterval.unref();
       }
     }
+  }
+
+  get activeSessionCount(): number {
+    return this.sessions.size;
   }
 
   getServices() {
@@ -230,13 +232,6 @@ export class SessionPool {
     });
   }
 
-  /**
-   * Check whether an archival operation is currently in progress for a chat
-   */
-  isArchiving(chatId: string | number): boolean {
-    return this.archiveMutex.isLocked(chatId);
-  }
-
   async listSessions(chatId: string | number): Promise<SessionInfo[]> {
     const chatDir = this.getChatSessionDir(chatId);
     const archiveDir = path.join(chatDir, ".archive");
@@ -264,11 +259,7 @@ export class SessionPool {
         const id = (parts.length > 1 && lastPart) ? lastPart : base;
         const shortId = id.slice(0, 8);
 
-        const { count, messages } = sessionArchiver.parseSessionFile(item.full);
-        const firstUser = messages.find((m) => m.role === "user");
-        const summary = firstUser
-          ? firstUser.text.slice(0, 70).replace(/\s+/g, " ")
-          : `Session (${count} messages)`;
+        const { count, summary } = sessionArchiver.peekSessionSummary(item.full);
 
         results.push({
           id,
