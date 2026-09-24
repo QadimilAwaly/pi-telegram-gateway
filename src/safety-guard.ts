@@ -87,23 +87,6 @@ function isProtectedGatewayPath(targetPath: string): boolean {
  * and guarantees that no bash execution can hang indefinitely.
  */
 export function gatewaySafetyExtension(pi: ExtensionAPI) {
-  // 1. Inject safety instructions into system prompt
-  pi.on("before_agent_start", async (event) => {
-    const safetyNotice = [
-      "",
-      "CRITICAL GATEWAY HOST PROTECTION RULES:",
-      `- You are operating through the Pi Telegram Gateway daemon (PID: ${gatewayPid}).`,
-      "- NEVER kill, terminate, or pkill the 'bun'/'node' process hosting this gateway.",
-      `- NEVER delete or destructively modify '${gatewayDir}' or '${sessionsDir}'.`,
-      "- If user requests to kill background processes, ONLY kill specific child task PIDs, never the gateway.",
-      "",
-    ].join("\n");
-
-    return {
-      systemPrompt: (event.systemPrompt || "") + safetyNotice,
-    };
-  });
-
   // Tool instances cache by cwd to prevent excessive garbage generation
   const bashTools = new Map<string, any>();
   const editTools = new Map<string, any>();

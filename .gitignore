@@ -40,6 +40,7 @@ temp/
 # Telegram Sessions & Media Artifacts
 sessions/
 telegram-sessions/
+workspace/
 images/
 *.session
 *.jsonl
